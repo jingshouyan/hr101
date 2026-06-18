@@ -36,8 +36,8 @@
 
 | 令牌 | 存储位置 | 有效期 | 用途 |
 |------|---------|--------|------|
-| **access_token** | 前端内存 / 请求头 | 30 分钟 | 调用业务接口 |
-| **refresh_token** | httpOnly Cookie | 7 天 | 静默续签 access_token |
+| **access_token** | 前端内存 / 请求头 | **5-15 分钟** | 调用业务接口，不放权限列表 |
+| **refresh_token** | httpOnly Cookie | 7 天 | 静默续签 access_token，续签时从 DB 重查最新权限 |
 
 ### Token 载荷
 
@@ -47,28 +47,31 @@
   "emp_id": 1001,
   "name": "张三",
   "dept_id": 20,
-  "dept_path": "/1/10/20/",
-  "roles": ["HR_MANAGER", "DEPT_HEAD"],
-  "permissions": ["employee:read", "employee:write", "salary:read"],
   "type": "access",
   "iat": 1718000000,
-  "exp": 1718001800
+  "exp": 1718000500     // 5 分钟后过期
 }
 ```
 
 > **设计要点**：
-> - `dept_path` 用于数据权限快速过滤（组织树路径）
-> - `roles` 和 `permissions` 放在 token 中，避免每次请求查数据库
+> - **access_token 不放角色和权限列表**，只放用户基本标识
+> - 每次请求的权限校验通过 `@PreAuthorize` 实时查 DB（见下文）
+> - `dept_path` 等数据权限字段也不放，数据权限通过 MyBatis-Plus 拦截器实时过滤
 > - token 不存敏感信息（手机号、身份证等）
+> - 短 TTL（5-15 分钟）减少泄漏风险
 
 ### 刷新流程
 
 ```
 access_token 过期 → API 返回 401
   └→ 前端调用 POST /auth/refresh（携带 refresh_token Cookie）
-      ├→ 成功：返回新 access_token
+      ├→ 成功：从 DB 重新查询权限 → 签发新 access_token
       └→ 失败：跳转登录页
 ```
+
+> 刷新时后端从 `emp_role` + `role_permission` 重新加载权限，
+> 所以新签发的 access_token 总是携带最新的权限。
+> 权限变更最多延迟一个 access_token 的生命周期（5-15 分钟）。
 
 ## 三、Spring Security 配置
 
@@ -187,6 +190,74 @@ CREATE TABLE role_permission (
 | HR 薪资专员 | `HR_PAYROLL` | 薪资核算、工资单查看（仅限数据） |
 | 部门主管 | `DEPT_HEAD` | 查看本部门员工、审批待办 |
 | 普通员工 | `EMPLOYEE` | 个人信息查看、请假申请、工资单查看（自己） |
+
+### 权限变更处理
+
+> JWT 无状态认证的核心矛盾：**签出去的 token 在过期前无法撤销**。
+> HR 系统对权限变更的时效性要求高（员工离职、调岗必须立即生效）。
+>
+> 策略：**不依赖 JWT 撤销，用短 TTL + 刷新时重查 + 出入职干预**。
+
+#### 核心策略
+
+| 手段 | 生效延迟 | 实现 |
+|------|---------|------|
+| **短 TTL** | access_token 5-15 分钟自动过期 | token 不放权限，载荷最小化 |
+| **刷新时重查** | 下一次续签时立即生效 | `POST /auth/refresh` 从 DB 重新加载权限 |
+| **删除 refresh_token** | 即时阻止续签 | 离职/调岗时 Redis 中删除 refresh_token |
+| **`@PreAuthorize` 实时查 DB** | 即时 | 每次请求由 `AuthService` 查 `emp_role` + `role_permission` |
+
+#### 典型场景处理
+
+```java
+// ========== 场景1：员工离职 ==========
+public void terminateEmployee(Long empId) {
+    // 1. 更新员工状态
+    employeeMapper.updateStatus(empId, "TERMINATED");
+
+    // 2. 删除所有 refresh_token → 前端用完后无法续签
+    refreshTokenRepository.deleteByEmpId(empId);
+
+    // 3. 原 access_token 最多存活 5-15 分钟
+    //    到期后没有新 token 可用，自动跳转登录页
+}
+
+// ========== 场景2：角色变更（如主管→普通员工） ==========
+public void changeUserRole(Long empId, Long newRoleId) {
+    // 1. 更新角色关联
+    empRoleMapper.update(empId, newRoleId);
+
+    // 2. 权限变更后，@PreAuthorize 在下一次请求时就已生效
+    //    因为权限查的是 DB，不是 token 里的缓存
+
+    // 3. 可选：删除 refresh_token 强制前端续签
+    //    不删也行，最多等一个 access_token 生命周期
+    refreshTokenRepository.deleteByEmpId(empId);
+}
+
+// ========== 场景3：紧急冻结账号 ==========
+public void freezeAccount(Long empId) {
+    employeeMapper.updateStatus(empId, "FROZEN");
+    refreshTokenRepository.deleteByEmpId(empId);
+    // 5 分钟后所有 token 失效
+}
+```
+
+#### 为什么不用黑名单？
+
+```java
+// 方案一：Redis 黑名单（不采用）
+// 每次请求查 Redis → 多一次 IO
+// 黑名单条数随 token 数量线性增长
+// HR 系统场景少（每天几次权限变更），不值得引入黑名单复杂度
+
+// 方案二：token_version 字段（备选）
+// 如果要求"秒级失效"，在 employee 表加版本号字段
+// 每次变更递增版本号，JWT 过滤器查 Redis 对比版本号
+// 代价：每次请求多一次 Redis GET，复杂度稍增
+```
+
+**结论**：MVP 只需 `短 TTL + 删除 refresh_token`。这俩组合已经覆盖离职/调岗/冻结场景。
 
 ### 权限粒度
 
