@@ -1,0 +1,590 @@
+# 认证与权限设计（JWT + Spring Security）
+
+> **技术选型**：Spring Security + JWT (jjwt) + RBAC
+> **目标**：无状态认证、菜单/按钮级权限控制、数据权限隔离
+
+---
+
+## 一、整体架构
+
+```
+┌──────────┐       ┌──────────────────┐       ┌──────────────┐
+│  前端     │──1──→│  登录接口          │──3──→  │  用户服务      │
+│  Vue 3   │       │  POST /auth/login │       │  Employee    │
+│          │←─2───│  返回 access_token │       └──────────────┘
+│          │       │  + refresh_token  │             │
+│          │       └──────────────────┘             │
+│          │                                         ▼
+│          │       ┌──────────────────┐       ┌──────────────┐
+│          │──4──→│  业务接口          │──5──→│  JWT 过滤器    │
+│          │       │  Header:          │       │  解析 token   │
+│          │       │  Authorization:   │       │  提取用户信息  │
+│          │       │  Bearer xxx       │       │  设置 Security-│
+│          │       └──────────────────┘       │  Context      │
+│          │                                   └──────┬───────┘
+│          │                                           ▼
+│          │                                   ┌──────────────┐
+│          │                                   │  权限校验      │
+│          │                                   │  @PreAuthorize│
+│          │                                   │  + 数据权限   │
+│          │                                   └──────────────┘
+```
+
+## 二、JWT 令牌设计
+
+### 双令牌机制
+
+| 令牌 | 存储位置 | 有效期 | 用途 |
+|------|---------|--------|------|
+| **access_token** | 前端内存 / 请求头 | 30 分钟 | 调用业务接口 |
+| **refresh_token** | httpOnly Cookie | 7 天 | 静默续签 access_token |
+
+### Token 载荷
+
+```json
+{
+  "sub": "1001",
+  "emp_id": 1001,
+  "name": "张三",
+  "dept_id": 20,
+  "dept_path": "/1/10/20/",
+  "roles": ["HR_MANAGER", "DEPT_HEAD"],
+  "permissions": ["employee:read", "employee:write", "salary:read"],
+  "type": "access",
+  "iat": 1718000000,
+  "exp": 1718001800
+}
+```
+
+> **设计要点**：
+> - `dept_path` 用于数据权限快速过滤（组织树路径）
+> - `roles` 和 `permissions` 放在 token 中，避免每次请求查数据库
+> - token 不存敏感信息（手机号、身份证等）
+
+### 刷新流程
+
+```
+access_token 过期 → API 返回 401
+  └→ 前端调用 POST /auth/refresh（携带 refresh_token Cookie）
+      ├→ 成功：返回新 access_token
+      └→ 失败：跳转登录页
+```
+
+## 三、Spring Security 配置
+
+### 安全过滤器链
+
+```
+/public/**           → 无需认证（登录、注册、验证码等）
+/auth/**             → 无需认证（登录、刷新）
+/swagger-ui/**       → 开发环境可访问
+/api/**              → 需要有效 JWT
+/api/admin/**        → 需要 ADMIN 角色
+```
+
+### 核心组件
+
+```java
+// 1. JWT 认证过滤器
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain) {
+        // 从 Header 取 token
+        // 解析 & 验证签名
+        // 提取用户信息 → 设置 SecurityContext
+        // chain.doFilter()
+    }
+}
+
+// 2. 自定义认证令牌
+public class JwtAuthenticationToken extends AbstractAuthenticationToken {
+    private final EmployeePrincipal principal;
+    // 已认证状态 = true
+}
+
+// 3. SecurityConfig
+@Configuration
+@EnableMethodSecurity  // 开启 @PreAuthorize
+public class SecurityConfig {
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http) {
+        http
+            .csrf(csrf -> csrf.disable())           // REST API 不需要
+            .sessionManagement(sm -> sm.sessionCreationPolicy(STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**").permitAll()
+                .requestMatchers("/auth/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+}
+```
+
+## 四、RBAC 权限模型
+
+### 数据模型
+
+```
+┌──────────┐     ┌────────────────┐     ┌──────────────┐
+│   用户    │────→│  用户-角色关联  │←────│    角色       │
+│ employee │     │  emp_role      │     │    role      │
+└──────────┘     └────────────────┘     └──────┬───────┘
+                                                │
+                                                │
+                                          ┌────▼───────┐
+                                          │  角色-权限   │
+                                          │  role_perm  │
+                                          └────┬───────┘
+                                                │
+                                          ┌────▼───────┐
+                                          │   权限       │
+                                          │  permission │
+                                          └────────────┘
+```
+
+```sql
+-- 权限（最细粒度的操作单位）
+CREATE TABLE permission (
+    code        VARCHAR(100) PRIMARY KEY,  -- 如 employee:read
+    name        VARCHAR(100) NOT NULL,      -- 如 "查看员工"
+    module      VARCHAR(50)  NOT NULL       -- 所属模块
+);
+
+-- 角色
+CREATE TABLE role (
+    id          BIGSERIAL PRIMARY KEY,
+    code        VARCHAR(50)  NOT NULL UNIQUE,  -- HR_MANAGER
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(500)
+);
+
+-- 用户-角色
+CREATE TABLE emp_role (
+    emp_id      BIGINT NOT NULL REFERENCES employee(id),
+    role_id     BIGINT NOT NULL REFERENCES role(id),
+    PRIMARY KEY (emp_id, role_id)
+);
+
+-- 角色-权限
+CREATE TABLE role_permission (
+    role_id         BIGINT NOT NULL REFERENCES role(id),
+    permission_code VARCHAR(100) NOT NULL REFERENCES permission(code),
+    PRIMARY KEY (role_id, permission_code)
+);
+```
+
+### 建议的 HR 角色
+
+| 角色 | 编码 | 说明 |
+|------|------|------|
+| 系统管理员 | `ADMIN` | 系统配置、用户管理、角色分配 |
+| HR 管理员 | `HR_MANAGER` | 员工管理、薪资管理、考勤管理全部权限 |
+| HR 专员 | `HR_OPERATOR` | 员工档案编辑、入职离职办理 |
+| HR 薪资专员 | `HR_PAYROLL` | 薪资核算、工资单查看（仅限数据） |
+| 部门主管 | `DEPT_HEAD` | 查看本部门员工、审批待办 |
+| 普通员工 | `EMPLOYEE` | 个人信息查看、请假申请、工资单查看（自己） |
+
+### 权限粒度
+
+权限编码格式：`{模块}:{操作}`
+
+| 模块 | 操作 | 编码示例 |
+|------|------|---------|
+| 员工 | 查看/新增/编辑/删除/导出 | `employee:read / :write / :delete / :export` |
+| 考勤 | 查看/编辑/审批 | `attendance:read / :write / :approve` |
+| 薪资 | 查看/核算/发放 | `salary:read / :calculate / :pay` |
+| 审批 | 查看/审批/干预 | `approval:view / :approve / :intervene` |
+
+## 五、数据权限（PostgreSQL 深度方案）
+
+> HR 系统数据权限的本质：**谁能看到哪些员工的数据？** 所有数据（考勤、薪资、绩效、审批）最终都挂在员工和组织树上。
+>
+> PostgreSQL 在数据权限上有天然优势：LTREE 扩展、递归 CTE、RLS、JSONB，比 MySQL 灵活得多。
+
+### 5.1 组织树设计（数据权限的基础）
+
+组织树是所有数据权限的根基。有两种方案：
+
+#### 方案 A：物化路径（推荐，适合 MyBatis-Plus）
+
+```sql
+CREATE TABLE department (
+    id          BIGSERIAL    PRIMARY KEY,
+    parent_id   BIGINT       REFERENCES department(id),
+    name        VARCHAR(100) NOT NULL,
+    path        VARCHAR(500) NOT NULL,   -- 物化路径，如 "/1/10/20/"
+    level       SMALLINT     NOT NULL,   -- 层级深度，根=1
+    sort_order  INT          DEFAULT 0
+);
+
+CREATE INDEX idx_dept_parent ON department(parent_id);
+CREATE INDEX idx_dept_path   ON department(path);
+```
+
+- `path = /1/10/20/` 表示：根→部门1→部门10→部门20
+- 查询部门 10 **及其所有子部门**：
+
+```sql
+SELECT id FROM department WHERE path LIKE '/1/10/%';
+```
+
+- 查询部门 20 的**所有祖先**（向上追溯）：
+
+```sql
+SELECT id FROM department WHERE '/1/10/20/' LIKE path || '%' AND id != 20;
+```
+
+**优势**：SQL 简单直观，MyBatis-Plus 的 `in` 查询直接拼字符串，不需数据库特殊功能。
+
+#### 方案 B：PostgreSQL LTREE 扩展（最强树查询）
+
+```sql
+CREATE EXTENSION IF NOT EXISTS ltree;
+
+CREATE TABLE department (
+    id          BIGSERIAL    PRIMARY KEY,
+    parent_id   BIGINT       REFERENCES department(id),
+    name        VARCHAR(100) NOT NULL,
+    path        LTREE        NOT NULL,       -- 如 "1.10.20"
+    sort_order  INT          DEFAULT 0
+);
+
+CREATE INDEX idx_dept_path_ltree ON department USING GIST (path);
+```
+
+**LTREE 操作符：**
+
+| 操作符 | 含义 | 示例 |
+|--------|------|------|
+| `@>` | 祖先包含后代 | `path @> '1.10'` → 1.10 的所有子孙 |
+| `<@` | 后代的祖先 | `path <@ '1.10.20'` → 1.10.20 的所有祖先 |
+| `~` | 正则匹配 | `path ~ '*.10.*'` → 路径中包含 10 的节点 |
+| `||` | 拼接 | `'1.10' || '20'` → `1.10.20` |
+
+```sql
+-- 查找部门 10 及其所有子部门（一键）
+SELECT id FROM department WHERE path <@ '1.10';
+
+-- 查找部门 20 的所有祖先
+SELECT id FROM department WHERE path @> '1.10.20' AND id != 20;
+
+-- 查找直接子部门（最常用）
+SELECT id FROM department WHERE path ~ '1.10.*{1}';
+```
+
+**优势**：查询性能最优（GiST 索引），语法最简洁，支持复杂的层级匹配。
+
+**劣势**：需要理解 LTREE 语法，MyBatis-Plus 的 `in` 查询需要额外处理。
+
+> **建议**：如果团队 PG 经验丰富 → **LTREE**；否则 → **物化路径**，功能够用且更通用。
+
+### 5.2 员工表中的权限相关字段
+
+```sql
+CREATE TABLE employee (
+    id              BIGSERIAL    PRIMARY KEY,
+    name            VARCHAR(50)  NOT NULL,
+    dept_id         BIGINT       NOT NULL REFERENCES department(id),
+    dept_path       VARCHAR(500) NOT NULL,    -- 冗余字段，来自 department.path，免联表
+    report_to       BIGINT       REFERENCES employee(id),  -- 直接上级
+    report_to_path  VARCHAR(500),             -- 上级链，如 "/101/201/301/"
+    emp_type        VARCHAR(20)  NOT NULL,     -- REGULAR / OUTSOURCE / INTERN / ...
+    status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+    ...
+);
+```
+
+> `dept_path` 从部门表冗余到员工表，**查询时不用 JOIN**，数据权限过滤效率最高。
+
+### 5.3 数据权限级别
+
+```java
+public enum DataScope {
+    ALL,          // 全公司可见 —— HR管理员、CEO
+    DEPT_TREE,    // 本部门及下级部门 —— 部门主管
+    DEPT,         // 仅本部门 —— HRBP
+    SELF,         // 仅自己 —— 普通员工
+    CUSTOM        // 自定义范围（扩展用）
+}
+```
+
+**每个角色对应的数据范围：**
+
+| 角色 | 数据范围 | 典型业务场景 |
+|------|---------|-------------|
+| ADMIN | ALL | 系统配置，无数据限制 |
+| HR_MANAGER | ALL | 看全公司员工档案 |
+| HR_OPERATOR | ALL | 办理入职离职不受部门限制 |
+| HR_PAYROLL | ALL | 全公司薪资（敏感操作有审计） |
+| DEPT_HEAD | DEPT_TREE | 看自己团队员工、考勤、绩效 |
+| HRBP | DEPT | 看所负责的部门 |
+| EMPLOYEE | SELF | 仅看自己 |
+
+### 5.4 核心实现：数据权限过滤器
+
+#### MyBatis-Plus 拦截器方式（推荐）
+
+这是中国 Java 生态中最成熟的方案 —— **拦截 Mapper 的 SQL，自动拼接数据权限条件**。
+
+```java
+@Component
+public class DataPermissionInterceptor implements InnerInterceptor {
+
+    @Override
+    public void beforeQuery(Executor executor, MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) {
+        // 1. 从 SecurityContext 获取当前用户
+        EmployeePrincipal current = SecurityUtils.getCurrentUser();
+        if (current == null || current.hasDataScope(DataScope.ALL)) {
+            return;  // ALL 范围无需拦截
+        }
+
+        // 2. 解析原始 SQL 的抽象语法树
+        String originalSql = boundSql.getSql();
+        String permissionSql = injectDataPermission(originalSql, current);
+        
+        // 3. 通过反射替换 BoundSql 中的 SQL
+        ReflectUtil.setFieldValue(boundSql, "sql", permissionSql);
+    }
+
+    private String injectDataPermission(String sql, EmployeePrincipal user) {
+        // 根据当前用户的数据范围，注入 WHERE 条件
+        // 正则/JSqlParser 解析 SQL，找到 FROM table，追加 dept_path 过滤
+    }
+}
+```
+
+**注入后的 SQL 效果：**
+
+```sql
+-- 原始 SQL
+SELECT * FROM employee WHERE status = 'ACTIVE' ORDER BY id
+
+-- DEPT_TREE 范围自动注入后
+SELECT * FROM employee 
+WHERE status = 'ACTIVE' 
+  AND dept_path LIKE '/1/10/%'  -- ← 自动加上，用户部门路径 = /1/10/
+ORDER BY id
+
+-- SELF 范围自动注入后
+SELECT * FROM employee 
+WHERE status = 'ACTIVE' 
+  AND id = 1001                 -- ← 自动加上，只查自己
+ORDER BY id
+```
+
+**表级别控制：** 不是所有表都需要数据权限过滤。通过注解标记：
+
+```java
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DataScope {
+    String tableAlias() default "";       -- 表别名，如 e
+    String deptPathColumn() default "dept_path";   -- 部门路径字段名
+    String empIdColumn() default "id";              -- 员工ID字段名
+    boolean enable() default true;
+}
+```
+
+```java
+// 员工表 Mapper —— 自动过滤
+@DataScope(tableAlias = "e")
+@Mapper
+public interface EmployeeMapper extends BaseMapper<Employee> {}
+
+// 配置表，不需要过滤
+@Mapper
+public interface SystemConfigMapper extends BaseMapper<SystemConfig> {}
+```
+
+#### 手动控制方式（适用于复杂查询）
+
+有些场景自动拦截不够用（如跨多表 JOIN），需要手动控制：
+
+```java
+@Service
+public class SalaryServiceImpl implements SalaryService {
+
+    @Override
+    public PageResult<SalaryVO> pageQuery(SalaryQuery query) {
+        // 获取当前用户的数据权限范围
+        DataScope scope = SecurityUtils.getCurrentUser().getDataScope();
+        
+        // 手写 Lambda QueryWrapper，条件清晰
+        LambdaQueryWrapper<Salary> wrapper = Wrappers.lambdaQuery();
+        
+        switch (scope) {
+            case ALL:
+                break;  // 无条件
+            case DEPT_TREE:
+                wrapper.in(Salary::getDeptId, getDeptTreeIds(user.getDeptId()));
+                break;
+            case DEPT:
+                wrapper.eq(Salary::getDeptId, user.getDeptId());
+                break;
+            case SELF:
+                wrapper.eq(Salary::getEmpId, user.getEmpId());
+                break;
+        }
+        return salaryMapper.selectPage(new Page<>(query.getPage(), query.getSize()), wrapper);
+    }
+}
+```
+
+### 5.5 PostgreSQL Row-Level Security（RLS）
+
+> 💡 RLS 是 PostgreSQL 独有的特性，**从数据库层面强制数据行权限**，即使绕过应用直接查数据库也受控。
+
+```sql
+-- 1. 启用 RLS
+ALTER TABLE employee ENABLE ROW LEVEL SECURITY;
+
+-- 2. 创建 RLS 策略（示例：员工只能看自己的数据）
+CREATE POLICY emp_self_policy ON employee
+    FOR ALL
+    USING (id = current_setting('app.current_emp_id')::BIGINT);
+
+-- 3. 部门主管看自己和下属的数据
+CREATE POLICY emp_dept_tree_policy ON employee
+    FOR SELECT
+    USING (
+        current_setting('app.data_scope') = 'DEPT_TREE'
+        AND dept_path LIKE (
+            SELECT path || '%' FROM department 
+            WHERE id = current_setting('app.dept_id')::BIGINT
+        )
+    );
+```
+
+**Java 端设置**：每次请求时，在 JWT 过滤器中设置 PostgreSQL session 变量：
+
+```java
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(...) {
+        // JWT 解析后，将用户上下文注入到 PG session
+        JdbcTemplate jdbc = ...;
+        jdbc.execute("SET app.current_emp_id = " + principal.getEmpId());
+        jdbc.execute("SET app.data_scope = '" + principal.getDataScope() + "'");
+        jdbc.execute("SET app.dept_id = " + principal.getDeptId());
+        
+        chain.doFilter(request, response);
+    }
+}
+```
+
+> **RLS 的优势与局限**：
+> - ✅ 安全级别最高，数据库层兜底
+> - ✅ 防止"忘了加权限过滤"的 Bug
+> - ❌ 调试复杂，策略多了排查困难
+> - ❌ 和 MyBatis-Plus 的分页/乐观锁配合需要额外测试
+>
+> **建议**：二期再引入 RLS 作为安全兜底层，一期先用应用层拦截器。
+
+### 5.6 完整流程示例
+
+以 **"部门主管查看团队员工列表"** 为例：
+
+```
+1. 用户登录
+   → JWT 中携带 dept_path = "/1/10/", data_scope = "DEPT_TREE"
+
+2. 前端请求 GET /api/employees?page=1&size=20
+
+3. JWT 过滤器解析 token，设置 SecurityContext
+   → principal.deptPath = "/1/10/"
+   → principal.dataScope = "DEPT_TREE"
+
+4. EmployeeMapper.selectPage() 执行
+   → DataPermissionInterceptor 拦截 SQL
+   → 注入 WHERE dept_path LIKE '/1/10/%'
+   → 最终 SQL:
+       SELECT * FROM employee 
+       WHERE status = 'ACTIVE' 
+         AND dept_path LIKE '/1/10/%'    ← 自动注入
+       ORDER BY id
+       LIMIT 20 OFFSET 0
+
+5. 结果：主管看到自己部门及所有下级部门的员工
+```
+
+### 5.7 各业务模块的数据权限矩阵
+
+| 模块 | 接口 | ADMIN | HR_MANAGER | DEPT_HEAD | HRBP | EMPLOYEE |
+|------|------|-------|-----------|-----------|------|----------|
+| 员工列表 | GET /employees | ALL | ALL | DEPT_TREE | DEPT | SELF |
+| 员工详情 | GET /employees/{id} | ALL | ALL | DEPT_TREE | DEPT | SELF |
+| 新增员工 | POST /employees | ALL | ALL | ❌ | ❌ | ❌ |
+| 薪资列表 | GET /salary | ALL | ALL | DEPT_TREE(仅查看) | ❌ | SELF |
+| 薪资核算 | POST /salary/calculate | ALL | ❌ | ❌ | ❌ | ❌ |
+| 考勤报表 | GET /attendance/report | ALL | ALL | DEPT_TREE | DEPT | SELF |
+| 审批待办 | GET /approval/todos | ALL | ALL | DEPT_TREE | DEPT | SELF |
+
+### 5.8 数据权限 + MyBatis-Plus 最佳实践
+
+```yaml
+# application.yml — MyBatis-Plus 配置
+mybatis-plus:
+  configuration:
+    # 驼峰转下划线
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      # PostgreSQL 主键策略
+      id-type: ASSIGN_ID
+  # 拦截器注入
+  config-location: classpath:mybatis-config.xml
+```
+
+```java
+@Configuration
+public class MyBatisPlusConfig {
+    
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        
+        // 分页插件（PostgreSQL 方言）
+        PaginationInnerInterceptor pagination = new PaginationInnerInterceptor(DbType.POSTGRES_SQL);
+        interceptor.addInnerInterceptor(pagination);
+        
+        // 数据权限插件（自定义，见上）
+        interceptor.addInnerInterceptor(new DataPermissionInterceptor());
+        
+        // 乐观锁插件（用于薪资并发修改）
+        interceptor.addInnerInterceptor(new OptimisticLockerInnerInterceptor());
+        
+        return interceptor;
+    }
+}
+```
+
+### 5.9 一期 vs 二期
+
+| 阶段 | 数据权限方案 | 原因 |
+|------|-------------|------|
+| **一期** | **手动拼接 `Wrappers.lambdaQuery()` + `eq`/`in` 条件** | 最简单，每行代码逻辑清晰，不出奇奇怪怪的 SQL 注入 Bug |
+| **二期** | **MyBatis-Plus DataPermissionInterceptor** | 模块多了以后减少重复代码，统一管理 |
+| **三期** | **PostgreSQL RLS 兜底** | 安全加固，防止绕过 |
+
+> **核心建议**：一期的数据权限**不要上拦截器**。每个 Mapper 方法显式传入当前用户的数据范围，比"魔法拦截"更可控。HR 系统的数据权限错误（如一个人看到全公司薪资）是严重生产事故，宁可代码多几行，不要靠黑魔法。
+
+## 六、一期 MVP 范围
+
+**必做：**
+- [x] JWT 双令牌（access + refresh）
+- [ ] 登录 / 退出接口
+- [ ] JWT 过滤器 + SecurityConfig
+- [ ] 角色 + 权限基础表结构
+- [ ] `@PreAuthorize` 接口级权限
+- [ ] 密码加密（BCryptPasswordEncoder）
+
+**二期再做：**
+- [ ] 数据权限拦截器
+- [ ] 权限管理界面（角色分配）
+- [ ] 操作审计日志
+- [ ] OAuth2 / SSO 集成
+- [ ] 菜单权限动态生成

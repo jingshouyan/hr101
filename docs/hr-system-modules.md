@@ -200,6 +200,8 @@
 | 层 | 选定方案 | 说明 |
 |---|---------|------|
 | **后端** | **Spring Boot 4.1 + JDK 25 (LTS)** | 生态成熟，HR 领域案例丰富 |
+| **ORM** | **MyBatis-Plus** | 代码生成、Lambda 查询、分页插件开箱即用 |
+| **认证** | **JWT（jjwt / spring-security）** | 无状态令牌，适用于前后端分离 |
 | **前端** | **Vue 3 + Element Plus** | 上手快，中文文档好，后台组件覆盖全面 |
 | **数据库** | **PostgreSQL + Redis** | PG 复杂查询能力强，Redis 做缓存/锁 |
 | **架构** | **Monorepo + 单体模块化**（一期） | 前后端同仓库，按模块分包 |
@@ -358,13 +360,15 @@ MVP      Redis Stream  ✅  够用（操作日志 + 简单通知）
 > ```
 > 后续前后端都稳定后，随时可以把 `backend/` 和 `frontend/` 拆成独立仓库，git 历史可以通过 `git filter-repo` 保留。
 
-### 3.9 推荐组合（已确认）
+### 3.10 推荐组合（已确认）
 
 ```
 后端    JDK 25 (LTS) + Spring Boot 4.1 (Java)
+ORM     MyBatis-Plus
+认证    JWT (Spring Security + jjwt)
 前端    Vue 3 + Element Plus
 数据库  PostgreSQL + Redis
-架构    单体模块化
+架构    Monorepo + 单体模块化
 审批    自研轻量引擎
 部署    Docker Compose
 文件    MinIO
@@ -372,7 +376,7 @@ MQ      RabbitMQ
 定时    XXL-JOB
 ```
 
-### 3.9 JDK 与 Spring Boot 版本推荐（2026年6月更新）
+### 3.11 JDK 与 Spring Boot 版本推荐（2026年6月更新）
 
 > ✅ 版本号已经官方来源确认（Spring Boot 4.1.0 / JDK 25 LTS）。
 
@@ -427,6 +431,8 @@ JDK 27 (LTS)  — 2026年9月预计 → 如果项目年底才启动可等这个
 ### 已确认 ✅
 
 - **技术栈**：Spring Boot 4.1 + JDK 25 (LTS) + Vue 3 + PostgreSQL + Docker Compose
+- **ORM**：MyBatis-Plus
+- **认证**：JWT（Spring Security + jjwt）
 - **审批引擎**：自研轻量引擎
 - **架构**：Monorepo + 一期单体模块化
 
