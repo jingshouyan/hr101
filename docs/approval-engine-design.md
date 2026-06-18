@@ -78,111 +78,187 @@
 └─────────────────┘
 ```
 
-### 关键表字段详解
+### 约定
 
-#### approval_flow（流程定义）
+- 所有表使用 `BIGSERIAL` 作为自增主键
+- 时间字段统一使用 `TIMESTAMPTZ`（`TIMESTAMP WITH TIME ZONE`）
+- `created_at` / `updated_at` 每表必加，`deleted_at` 按需添加（软删除）
+- 标志位用 `BOOLEAN` 而非 `SMALLINT`
+- JSON 字段用 `JSONB`（PostgreSQL 二进制 JSON，支持索引和高效查询）
+- 字段注释通过 `COMMENT ON COLUMN` 定义
+
+### approval_flow（流程定义）
 
 ```sql
 CREATE TABLE approval_flow (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    name            VARCHAR(100)    NOT NULL COMMENT '流程名称，如"请假审批"',
-    code            VARCHAR(50)     NOT NULL UNIQUE COMMENT '流程编码，如 LEAVE_DAILY',
-    description     VARCHAR(500)    COMMENT '流程说明',
-    status          TINYINT         NOT NULL DEFAULT 1 COMMENT '1=启用 0=停用',
-    initiator_type  VARCHAR(50)     COMMENT '发起人类型：ALL / EMPLOYEE_TYPE / DEPT',
-    version         INT             NOT NULL DEFAULT 1 COMMENT '版本号',
-    created_at      DATETIME        NOT NULL,
-    updated_at      DATETIME        NOT NULL
+    id              BIGSERIAL       PRIMARY KEY,
+    name            VARCHAR(100)    NOT NULL,
+    code            VARCHAR(50)     NOT NULL UNIQUE,
+    description     VARCHAR(500),
+    status          SMALLINT        NOT NULL DEFAULT 1,   -- 1=启用 0=停用
+    initiator_type  VARCHAR(50),                           -- ALL / EMPLOYEE_TYPE / DEPT
+    version         INT             NOT NULL DEFAULT 1,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    deleted_at      TIMESTAMPTZ                              -- 软删除，归档旧流程定义
 );
+
+COMMENT ON TABLE  approval_flow        IS '审批流程定义';
+COMMENT ON COLUMN approval_flow.name   IS '流程名称，如"请假审批"';
+COMMENT ON COLUMN approval_flow.code   IS '流程编码，如 LEAVE_DAILY';
+COMMENT ON COLUMN approval_flow.status IS '1=启用 0=停用';
+COMMENT ON COLUMN approval_flow.initiator_type IS '发起人限制：ALL=所有人 / EMPLOYEE_TYPE=按员工类型 / DEPT=按部门';
+COMMENT ON COLUMN approval_flow.version IS '版本号，每次修改递增';
 ```
 
-#### approval_node（审批节点）
+### approval_node（审批节点）
 
 ```sql
 CREATE TABLE approval_node (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    flow_id         BIGINT          NOT NULL COMMENT '所属流程',
-    name            VARCHAR(100)    NOT NULL COMMENT '节点名，如"主管审批"',
-    type            VARCHAR(20)     NOT NULL COMMENT 'APPROVE(单人) / COUNTERSIGN(会签) / OR_SIGN(或签)',
-    order_index     INT             NOT NULL COMMENT '节点顺序，从1开始',
-    timeout_hours   INT             DEFAULT 48 COMMENT '超时小时数，超时自动升级',
-    skip_empty      TINYINT         DEFAULT 0 COMMENT '当审批人为空时是否自动跳过',
-    node_config     JSON            COMMENT '扩展配置，见下方说明',
-    created_at      DATETIME        NOT NULL,
-    updated_at      DATETIME        NOT NULL
+    id              BIGSERIAL       PRIMARY KEY,
+    flow_id         BIGINT          NOT NULL REFERENCES approval_flow(id),
+    name            VARCHAR(100)    NOT NULL,
+    type            VARCHAR(20)     NOT NULL,               -- APPROVE / COUNTERSIGN / OR_SIGN
+    order_index     INT             NOT NULL,
+    timeout_hours   INT             DEFAULT 48,
+    skip_empty      BOOLEAN         NOT NULL DEFAULT FALSE,  -- 审批人为空时自动跳过
+    reject_to       VARCHAR(20)     NOT NULL DEFAULT 'prev', -- prev / start / end
+    node_config     JSONB,                                   -- 扩展配置
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    deleted_at      TIMESTAMPTZ
 );
+
+COMMENT ON TABLE  approval_node         IS '审批节点定义';
+COMMENT ON COLUMN approval_node.type    IS 'APPROVE(单人审批) / COUNTERSIGN(会签) / OR_SIGN(或签)';
+COMMENT ON COLUMN approval_node.order_index IS '节点顺序，从1开始';
+COMMENT ON COLUMN approval_node.timeout_hours IS '超时小时数，超时自动催办';
+COMMENT ON COLUMN approval_node.skip_empty IS '当审批人为空时是否自动跳过此节点';
+COMMENT ON COLUMN approval_node.reject_to IS '驳回目标：prev=上一节点 start=重新发起 end=终止';
 ```
 
 `node_config` 示例：
 ```json
 {
-  "allowEdit": false,
   "allowAddCc": true,
-  "rejectTo": "prev",          // 驳回目标：prev(上一节点)/start(重新发起)/end(终止)
-  "autoApproval": false        // 发起人和审批人相同时是否自动通过
+  "autoApproval": false,
+  "formPermissions": { "view": ["*"], "edit": [] }
 }
 ```
 
-#### approver_rule（审批人规则）
+### approver_rule（审批人规则）
 
 ```sql
 CREATE TABLE approver_rule (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    node_id         BIGINT          NOT NULL,
-    rule_type       VARCHAR(50)     NOT NULL COMMENT '审批人规则类型',
-    rule_config     JSON            NOT NULL COMMENT '规则配置',
-    created_at      DATETIME        NOT NULL
+    id              BIGSERIAL       PRIMARY KEY,
+    node_id         BIGINT          NOT NULL REFERENCES approval_node(id),
+    rule_type       VARCHAR(50)     NOT NULL,
+    rule_config     JSONB           NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    deleted_at      TIMESTAMPTZ
 );
+
+COMMENT ON TABLE  approver_rule          IS '审批人规则定义';
+COMMENT ON COLUMN approver_rule.rule_type IS '审批人规则类型（见下方表格）';
+COMMENT ON COLUMN approver_rule.rule_config IS '规则配置 JSON，不同 rule_type 结构不同';
 ```
 
 **rule_type 支持的类型：**
 
 | rule_type | 说明 | rule_config 示例 |
 |-----------|------|-----------------|
-| `REPORT_TO` | 直接上级（最常见） | `{"level": 1}` 第1级上级 |
+| `REPORT_TO` | 直接上级（最常见） | `{"level": 1}` |
 | `DEPT_HEAD` | 部门负责人 | `{}` |
 | `HRBP` | 对应 HRBP | `{}` |
-| `FIXED_USER` | 固定审批人 | `{"userIds": [1, 2]}` |
-| `ROLE` | 按角色 | `{"roleCode": "CEO"}` |
-| `REPORT_TO_LEVEL` | 上N级审批 | `{"level": 2}` 上2级 |
-| `SELF` | 发起人自己（通常只在开始节点） | `{}` |
-| `VARIABLE` | 表单字段指定 | `{"field": "approver"}` 从表单取值 |
+| `FIXED_USER` | 固定审批人 | `{"user_ids": [1, 2]}` |
+| `ROLE` | 按角色 | `{"role_code": "CEO"}` |
+| `REPORT_TO_LEVEL` | 上N级审批 | `{"level": 2}` |
+| `SELF` | 发起人自己（通常仅在开始节点） | `{}` |
+| `VARIABLE` | 表单字段指定 | `{"field": "approver"}` |
 | `DYNAMIC` | 扩展点，代码动态计算 | `{"bean": "customApproverService"}` |
 
-> **核心设计**：审批人规则解析器 (`ApproverResolver`) 根据 `rule_type` + `rule_config` + `form_data` 动态计算出具体审批人列表。每种 rule_type 只需实现一个 Resolver，可插拔。
+> **核心设计**：审批人规则解析器 (`ApproverResolver`) 根据 `rule_type` + `rule_config` + `form_data` 动态计算出具体审批人列表。每种 `rule_type` 只需实现一个 Resolver，可插拔。
 
-#### approval_instance（审批实例）
+### approval_instance（审批实例）
 
 ```sql
 CREATE TABLE approval_instance (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    flow_id         BIGINT          NOT NULL,
-    business_type   VARCHAR(50)     NOT NULL COMMENT '业务类型：LEAVE / OVERTIME / REIMBURSE / ...',
-    business_id     BIGINT          NOT NULL COMMENT '业务记录ID',
-    title           VARCHAR(200)    NOT NULL COMMENT '审批标题，如"张三的请假申请(2026-06-15)"',
-    initiator_id    BIGINT          NOT NULL COMMENT '发起人',
-    form_data       JSON            COMMENT '表单数据快照',
-    status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/APPROVED/REJECTED/CANCELLED',
-    current_node_id BIGINT          COMMENT '当前待审批节点',
-    created_at      DATETIME        NOT NULL,
-    finished_at     DATETIME        COMMENT '完成时间',
-    updated_at      DATETIME        NOT NULL
+    id              BIGSERIAL       PRIMARY KEY,
+    flow_id         BIGINT          NOT NULL REFERENCES approval_flow(id),
+    business_type   VARCHAR(50)     NOT NULL,
+    business_id     BIGINT          NOT NULL,
+    title           VARCHAR(200)    NOT NULL,
+    initiator_id    BIGINT          NOT NULL,
+    form_data       JSONB,
+    status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
+    current_node_id BIGINT          REFERENCES approval_node(id),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    finished_at     TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ
 );
+
+COMMENT ON TABLE  approval_instance              IS '审批实例（每次审批发起生成一条记录）';
+COMMENT ON COLUMN approval_instance.business_type IS '业务类型：LEAVE / OVERTIME / REIMBURSE / CONTRACT / ...';
+COMMENT ON COLUMN approval_instance.business_id   IS '业务记录 ID';
+COMMENT ON COLUMN approval_instance.title         IS '审批标题，如"张三的请假申请"';
+COMMENT ON COLUMN approval_instance.initiator_id  IS '发起人 employee_id';
+COMMENT ON COLUMN approval_instance.form_data     IS '表单数据快照（JSONB）';
+COMMENT ON COLUMN approval_instance.status        IS 'PENDING / APPROVED / REJECTED / CANCELLED';
+COMMENT ON COLUMN approval_instance.current_node_id IS '当前待审批节点（null 表示待发起或已完成）';
+COMMENT ON COLUMN approval_instance.finished_at   IS '审批完成时间';
+COMMENT ON COLUMN approval_instance.deleted_at    IS '软删除/归档时间';
 ```
 
-#### approval_record（审批记录）
+### approval_record（审批记录）
 
 ```sql
 CREATE TABLE approval_record (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    instance_id     BIGINT          NOT NULL,
-    node_id         BIGINT          NOT NULL,
-    operator_id     BIGINT          NOT NULL COMMENT '操作人',
-    action          VARCHAR(20)     NOT NULL COMMENT 'APPROVE(通过) / REJECT(驳回) / RETURN(退回) / DELEGATE(转交) / ADD_APPROVER(加签)',
-    comment         VARCHAR(1000)   COMMENT '审批意见',
-    attachments     JSON            COMMENT '附件',
-    created_at      DATETIME        NOT NULL
+    id              BIGSERIAL       PRIMARY KEY,
+    instance_id     BIGINT          NOT NULL REFERENCES approval_instance(id),
+    node_id         BIGINT          NOT NULL REFERENCES approval_node(id),
+    operator_id     BIGINT          NOT NULL,
+    action          VARCHAR(20)     NOT NULL,
+    comment         VARCHAR(1000),
+    attachments     JSONB,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
 );
+
+COMMENT ON TABLE  approval_record            IS '审批操作记录（变更审计日志，不可修改/删除）';
+COMMENT ON COLUMN approval_record.operator_id IS '操作人 employee_id';
+COMMENT ON COLUMN approval_record.action      IS 'APPROVE(通过) / REJECT(驳回) / RETURN(退回) / DELEGATE(转交) / ADD_APPROVER(加签)';
+COMMENT ON COLUMN approval_record.comment     IS '审批意见';
+COMMENT ON COLUMN approval_record.attachments IS '附件列表 JSONB';
+```
+
+> `approval_record` 是审计日志，**不设 `deleted_at` 和 `updated_at`**，数据不可变（immutable）。
+
+### 索引
+
+```sql
+-- approval_flow
+CREATE INDEX idx_flow_code     ON approval_flow(code)    WHERE deleted_at IS NULL;
+
+-- approval_node
+CREATE INDEX idx_node_flow_id  ON approval_node(flow_id) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX uk_node_order ON approval_node(flow_id, order_index) WHERE deleted_at IS NULL;
+
+-- approver_rule
+CREATE INDEX idx_rule_node_id  ON approver_rule(node_id) WHERE deleted_at IS NULL;
+
+-- approval_instance（查询最频繁的表）
+CREATE INDEX idx_inst_status      ON approval_instance(status);
+CREATE INDEX idx_inst_initiator   ON approval_instance(initiator_id);
+CREATE INDEX idx_inst_business    ON approval_instance(business_type, business_id);
+CREATE INDEX idx_inst_flow_status ON approval_instance(flow_id, status);
+CREATE INDEX idx_inst_created     ON approval_instance(created_at DESC);
+CREATE INDEX idx_inst_deleted     ON approval_instance(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- approval_record
+CREATE INDEX idx_record_instance  ON approval_record(instance_id);
+CREATE INDEX idx_record_operator  ON approval_record(operator_id);
+CREATE INDEX idx_record_created   ON approval_record(created_at DESC);
 ```
 
 ---
