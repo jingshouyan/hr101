@@ -205,7 +205,7 @@
 | **架构** | **单体模块化**（一期） | 按模块分包，后续可拆微服务 |
 | **部署** | **Docker Compose**（MVP） | 一期简化运维，后续上 K8s |
 | **文件存储** | **MinIO** | 私有化部署，兼容 S3 API |
-| **消息队列** | **Redis Stream**（MVP）→ RabbitMQ | MVP 够用，量大再上 |
+| **消息队列** | **RabbitMQ**（推荐） | 见下方详细对比分析 |
 | **定时任务** | **XXL-JOB** | 薪资计算、考勤汇总等 |
 | **审批引擎** | **自研轻量引擎** | 贴合 HR 审批场景，避免 BPMN 过重 |
 
@@ -276,21 +276,69 @@
 | 搜索引擎 | **不急需** | 员工/简历搜索量不大时 PG 全文索引够用 |
 | 部署 | **Docker Compose**（MVP）→ K8s（二期） | 一期简化运维 |
 
-### 3.7 推荐组合（MVP）
+### 3.7 消息队列选型分析
+
+> HR 系统中消息队列的使用场景：异步通知（审批待办推送、工资单生成完成）、模块解耦（考勤数据→薪资计算）、定时任务分发、操作日志异步写入。
+
+| 维度 | Redis Stream | RabbitMQ | Kafka |
+|------|-------------|----------|-------|
+| **本质** | Redis 的数据类型之一 | 专业消息中间件 | 分布式事件流平台 |
+| **定位** | 轻量消息通道 | 企业级消息代理 | 高吞吐事件管道 |
+| **消息模型** | 消费组 + 消费者 | Exchange + Queue + Binding | Topic + Partition + Consumer Group |
+| **持久化** | RDB / AOF（为缓存设计，非消息优先）| 消息确认后删除或保留 | 按配置保留（默认7天），可重放 |
+| **吞吐量** | 中等（单线程模型，受限于 Redis 主线程）| 数万/秒 | 百万/秒 |
+| **可靠性** | ACK 机制 + PEL（待处理列表），宕机可能丢少量数据 | AMQP 协议，Publisher Confirm + 消费 ACK，**可靠性最高** | 高可用 + ISR 副本机制，可靠性高 |
+| **延迟** | 微秒级（内存操作）| 毫秒级 | 毫秒级（批量攒消息）|
+| **消息回溯** | 不支持（消费后即删除） | 不支持（消费确认即删除）| **支持**（按 offset 回溯重放）|
+| **死信队列** | 需手动实现 | **内置 DLX**（死信交换机） | 需手动实现 |
+| **延迟消息** | 不原生支持（可通过 ZSET 近似实现）| **内置**（插件或 DLX 实现） | 不原生支持 |
+| **运维成本** | 极低（复用已有 Redis） | 低（Erlang 写的，稳定，Java 客户端成熟）| **高**（ZooKeeper / KRaft，需专职运维）|
+| **与 Spring Boot 集成** | Spring Data Redis 支持 | **Spring AMQP / RabbitTemplate 开箱即用** | Spring Kafka 支持 |
+| **监控** | Redis 自带 MONITOR / INFO | **管理控制台**（队列深度、消费速率、连接数） | 需配套 Kafka Manager / Cruise Control |
+
+#### HR 系统消息场景清单
+
+| 场景 | 频次 | 要求 | 推荐方案 |
+|------|------|------|----------|
+| 审批待办通知（企微/钉钉/邮件推送）| 高频、短消息 | 低延迟、不丢消息 | RabbitMQ |
+| 考勤打卡数据异步处理 | 高频（全员打上下班卡） | 顺序性要求低，吞吐要求中等 | RabbitMQ |
+| 薪资计算任务分发 | 低频（月度）| 可靠性优先，不要重复/丢失 | RabbitMQ |
+| 工资单生成 + 推送通知 | 低频（月度批量） | 事务性，确保全成功 | RabbitMQ |
+| 合同到期批量提醒 | 低频（每日扫描） | 不关键 | Redis Stream 甚至 Spring Scheduler 即可 |
+| 操作日志异步写入 | 高频 | 可以接受少量丢失 | Redis Stream |
+| **预留**：未来大数据分析（考勤趋势、人力成本分析） | - | 高吞吐、支持回溯 | Kafka |
+
+#### 结论
 
 ```
-后端    Spring Boot / Go  (按团队)
-前端    React / Vue 3     (按团队)
+MVP      Redis Stream  ✅  够用（操作日志 + 简单通知）
+正式上   RabbitMQ     ✅✅  推荐，HR 场景的完美匹配
+大数据   +Kafka         可选，三四期再考虑
+```
+
+**推荐理由**：
+1. **HR 系统的消息特征是"可靠小消息、中等吞吐"** —— 这正是 RabbitMQ 的设计目标
+2. Spring Boot + RabbitMQ 集成度极高（`RabbitTemplate`、`@RabbitListener`、死信队列声明式配置）
+3. 内置延迟消息（`rabbitmq-delayed-message-exchange` 插件），HR 审批超时提醒开箱即用
+4. 内置死信队列（DLX），薪资计算失败的消息自动进入死信人工排查
+5. 管理控制台清晰，非开发人员（运维）也能看懂队列状态
+6. Redis Stream 的问题：复用 Redis 实例会影响缓存性能；单独部署 Redis 又失去"复用"优势
+
+> **所以纠正之前的推荐**：中大型项目直接上 **RabbitMQ**，小型 MVP 先 Redis Stream 过渡也可以，但建议一步到位。
+
+### 3.8 推荐组合（已确认）
+
+```
+后端    Spring Boot (Java)
+前端    Vue 3 + Element Plus
 数据库  PostgreSQL + Redis
 架构    单体模块化
 审批    自研轻量引擎
 部署    Docker Compose
 文件    MinIO
-MQ      Redis Stream
-定时    XXL-JOB / Spring Scheduler
+MQ      RabbitMQ
+定时    XXL-JOB
 ```
-
-> ⚠️ 最终选型前需要确认：团队主力语言是什么？
 
 ---
 
