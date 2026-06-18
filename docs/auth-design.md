@@ -149,13 +149,14 @@ HR 系统的权限有几个特点：
 ```
 
 ```sql
--- 角色（权限合并为 TEXT[] 数组）
+-- 角色（权限合并为 TEXT[] 数组，数据范围作为角色固有属性）
 CREATE TABLE role (
     id            BIGSERIAL    PRIMARY KEY,
     code          VARCHAR(50)  NOT NULL UNIQUE,  -- HR_MANAGER
     name          VARCHAR(100) NOT NULL,
     description   VARCHAR(500),
-    permissions   TEXT[]       NOT NULL DEFAULT '{}'  -- 如 {"employee:read","employee:write"}
+    permissions   TEXT[]       NOT NULL DEFAULT '{}',  -- 如 {"employee:read","employee:write"}
+    data_scope    VARCHAR(20)  NOT NULL DEFAULT 'SELF' -- ALL / DEPT_TREE / DEPT / SELF
 );
 
 CREATE INDEX idx_role_perms ON role USING GIN (permissions);
@@ -255,13 +256,33 @@ public class RolePermissionInitializer implements CommandLineRunner {
 ```
 
 ```java
-// 每个角色的权限集合（集中在 Permissions 类中维护）
+// 每个角色的权限集合 + 数据范围（集中在 Permissions 类中维护）
 public static final String[] ALL        = {"employee:read", "employee:write", ..., "sys:config"};
 public static final String[] HR_FULL    = {"employee:read", "employee:write", ..., "attendance:approve"};
 public static final String[] HR_OPERATE = {"employee:read", "employee:write", "employee:export"};
 public static final String[] DEPT_HEAD  = {"employee:read", "attendance:read", "approval:view", "approval:approve"};
 public static final String[] EMPLOYEE   = {"employee:read", "attendance:read", "approval:view"};
 ```
+
+初始化也需要同步传入 `data_scope`：
+
+```java
+@Component
+public class RolePermissionInitializer implements CommandLineRunner {
+    @Override
+    public void run(String... args) {
+        insertRole("ADMIN",       "系统管理员",     Permissions.ALL,        DataScope.ALL);
+        insertRole("HR_MANAGER",  "HR 管理员",      Permissions.HR_FULL,    DataScope.ALL);
+        insertRole("HR_OPERATOR", "HR 专员",        Permissions.HR_OPERATE, DataScope.ALL);
+        insertRole("HR_PAYROLL",  "HR 薪资专员",    Permissions.HR_PAYROLL, DataScope.ALL);
+        insertRole("DEPT_HEAD",   "部门主管",       Permissions.DEPT_HEAD,  DataScope.DEPT_TREE);
+        insertRole("HRBP",        "HRBP",           Permissions.HRBP,       DataScope.DEPT);
+        insertRole("EMPLOYEE",    "普通员工",       Permissions.EMPLOYEE,   DataScope.SELF);
+    }
+}
+```
+
+> `data_scope` 是角色的固有属性：DEPT_HEAD 的角色定义就是管自己团队，不管谁担任这个角色。用户如果兼任多个角色，取所有角色中的 **最大范围**（ALL > DEPT_TREE > DEPT > SELF）。
 
 > 权限变更时：修改 `Permissions.java` 中的数组 → 执行 `update role set permissions = ? where code = ?` → 生效。
 > 不需要建表、不需要外键、不需要中间表。
@@ -459,20 +480,32 @@ CREATE TABLE employee (
 
 ### 5.3 数据权限级别
 
+> `data_scope` 是 **role 表的字段**，不是 emp_role 的扩展字段。因为数据范围是角色的固有属性 —— DEPT_HEAD 天然就该管自己团队，不管谁在这个位置。用户兼任多角色时取所有角色的 **最大范围**（ALL > DEPT_TREE > DEPT > SELF）。
+
 ```java
 public enum DataScope {
-    ALL,          // 全公司可见 —— HR管理员、CEO
-    DEPT_TREE,    // 本部门及下级部门 —— 部门主管
-    DEPT,         // 仅本部门 —— HRBP
-    SELF,         // 仅自己 —— 普通员工
+    ALL,          // 全公司可见
+    DEPT_TREE,    // 本部门及下级部门
+    DEPT,         // 仅本部门
+    SELF,         // 仅自己
     CUSTOM        // 自定义范围（扩展用）
+}
+
+public class EmployeePrincipal {
+    // 取用户所有角色中的最大 data_scope
+    public DataScope getEffectiveDataScope() {
+        return userRoles.stream()
+            .map(Role::getDataScope)
+            .min(Comparator.comparingInt(DataScope::getLevel))  // ALL=0 > ... > SELF=3
+            .orElse(DataScope.SELF);
+    }
 }
 ```
 
 **每个角色对应的数据范围：**
 
-| 角色 | 数据范围 | 典型业务场景 |
-|------|---------|-------------|
+| 角色 | 数据范围（role.data_scope） | 典型业务场景 |
+|------|---------------------------|-------------|
 | ADMIN | ALL | 系统配置，无数据限制 |
 | HR_MANAGER | ALL | 看全公司员工档案 |
 | HR_OPERATOR | ALL | 办理入职离职不受部门限制 |
