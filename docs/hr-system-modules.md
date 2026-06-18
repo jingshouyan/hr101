@@ -199,7 +199,7 @@
 
 | 层 | 选定方案 | 说明 |
 |---|---------|------|
-| **后端** | **Spring Boot (Java)** | 生态成熟，HR 领域案例丰富 |
+| **后端** | **Spring Boot 3.4 + JDK 21** | 生态成熟，HR 领域案例丰富 |
 | **前端** | **Vue 3 + Element Plus** | 上手快，中文文档好，后台组件覆盖全面 |
 | **数据库** | **PostgreSQL + Redis** | PG 复杂查询能力强，Redis 做缓存/锁 |
 | **架构** | **单体模块化**（一期） | 按模块分包，后续可拆微服务 |
@@ -329,7 +329,7 @@ MVP      Redis Stream  ✅  够用（操作日志 + 简单通知）
 ### 3.8 推荐组合（已确认）
 
 ```
-后端    Spring Boot (Java)
+后端    JDK 21 + Spring Boot 3.4 (Java)
 前端    Vue 3 + Element Plus
 数据库  PostgreSQL + Redis
 架构    单体模块化
@@ -340,13 +340,54 @@ MQ      RabbitMQ
 定时    XXL-JOB
 ```
 
+### 3.9 JDK 与 Spring Boot 版本推荐
+
+| 组件 | 推荐版本 | 说明 |
+|------|---------|------|
+| **JDK** | **21 (LTS)** | 2023年9月发布，支持到2031年。引入虚拟线程（Virtual Threads）、Record Pattern、Pattern Matching、Sequenced Collections，对 HR 系统 I/O 密集型场景（审批推送、报表导出、批量工资计算）有明显提升 |
+| **Spring Boot** | **3.4.x** | 要求 JDK 17+，3.4 是目前最新稳定线。内置虚拟线程支持（`spring.threads.virtual.enabled=true`），Spring Data JDBC / JPA 均有改进 |
+| **Spring Framework** | **6.2.x**（随 Boot 3.4 自带） | 含虚拟线程 + 声明式事务优化 |
+| **Spring Cloud** | **2024.0.x**（可选） | 当前最新，一期单体不需要，仅为后续微服务化预留 |
+| **构建工具** | **Maven**（推荐）/ Gradle | Maven 在企业 Java 生态更普及，依赖管理成熟；Gradle 构建更快但学习成本略高 |
+
+#### JDK 版本速览
+
+```
+JDK 17 (LTS)  — 2021年 → 非常成熟，但到 2024 已不是推荐起点
+JDK 21 (LTS)  — 2023年 → ✅ 推荐，当前最佳起点，安全用到 2031
+JDK 23         — 2024年 → 非 LTS，跳过
+JDK 25 (LTS)  — 2025年9月预计 → 如果项目下半年才启动可考虑，但目前建议 21
+```
+
+#### 为什么 JDK 21 而不是 17？
+
+| 特性 | 对 HR 系统的价值 |
+|------|----------------|
+| **虚拟线程** (Virtual Threads) | 审批流程中大量 IO 等待（发通知、写日志），虚拟线程用少量 OS 线程处理大量并发任务，**不改代码直接提升吞吐** |
+| **Record Pattern** | 工资项、考勤规则等值对象用 Record 建模，配合 Pattern Matching 使代码更简洁 |
+| **Sequenced Collections** | 组织树层级、审批链顺序操作更方便 |
+| **更长的支持周期** | 21 支持到 2031 年，比 17 多 2 年 |
+
+#### Spring Boot 版本对照
+
+| Boot 版本 | Spring Framework | JDK 要求 | 状态 | 建议 |
+|-----------|-----------------|----------|------|------|
+| 3.2.x | 6.1.x | 17+ | 维护中 | 可选，但建议直接上 3.4 |
+| **3.3.x** | **6.1.x** | **17+** | **维护中** | ✅ 可选，成熟稳定 |
+| **3.4.x** | **6.2.x** | **17+** | **当前最新** | ✅✅ **推荐** |
+| 3.5.x (2025H2) | 6.3.x | 17+ | 未发布 | 项目启动时可能是当前版 |
+
+> **推荐总结：JDK 21 + Spring Boot 3.4.x + Maven**
+> 
+> 这两个版本配合使用有 Spring 官方的最佳实践经验，虚拟线程 + 响应式编程可按需选配。HR 系统一期不涉及高并发，关键是开发效率和运行稳定，这个组合正好匹配。
+
 ---
 
 ## 四、讨论点（待决策）
 
 ### 已确认 ✅
 
-- **技术栈**：Spring Boot + Vue 3 + PostgreSQL + Docker Compose
+- **技术栈**：Spring Boot 3.4 + JDK 21 + Vue 3 + PostgreSQL + Docker Compose
 - **审批引擎**：自研轻量引擎
 - **架构**：一期单体模块化
 
