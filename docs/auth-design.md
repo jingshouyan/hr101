@@ -46,7 +46,9 @@
   "sub": "1001",
   "emp_id": 1001,
   "name": "张三",
-  "dept_id": 20,
+  "primary_dept_id": 20,
+  "dept_ids": [20, 25],           // 所属所有部门 ID（含主部门）
+  "managed_paths": ["/1/10/"],   // 管辖的部门路径集合（DEPT_TREE/DEPT 角色用）
   "type": "access",
   "iat": 1718000000,
   "exp": 1718000500     // 5 分钟后过期
@@ -55,10 +57,9 @@
 
 > **设计要点**：
 > - **access_token 不放角色和权限列表**，只放用户基本标识
-> - 每次请求的权限校验通过 `@PreAuthorize` 实时查 DB（见下文）
-> - `dept_path` 等数据权限字段也不放，数据权限通过 MyBatis-Plus 拦截器实时过滤
+> - `dept_ids` 和 `managed_paths` 放在 token 中，因为每次请求的数据权限过滤都需要它们，实时查 DB 压力大
+> - 短 TTL（5-15 分钟）减少泄漏风险，权限变更最多延迟一个 token 生命周期
 > - token 不存敏感信息（手机号、身份证等）
-> - 短 TTL（5-15 分钟）减少泄漏风险
 
 ### 刷新流程
 
@@ -463,20 +464,37 @@ SELECT id FROM department WHERE path ~ '1.10.*{1}';
 ### 5.2 员工表中的权限相关字段
 
 ```sql
+-- 员工表（剥离部门归属，只保留最基本的个人属性）
 CREATE TABLE employee (
     id              BIGSERIAL    PRIMARY KEY,
     name            VARCHAR(50)  NOT NULL,
-    dept_id         BIGINT       NOT NULL REFERENCES department(id),
-    dept_path       VARCHAR(500) NOT NULL,    -- 冗余字段，来自 department.path，免联表
-    report_to       BIGINT       REFERENCES employee(id),  -- 直接上级
-    report_to_path  VARCHAR(500),             -- 上级链，如 "/101/201/301/"
     emp_type        VARCHAR(20)  NOT NULL,     -- REGULAR / OUTSOURCE / INTERN / ...
     status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
-    ...
+    primary_dept_id BIGINT       REFERENCES department(id),  -- 主部门（冗余，高频查询免 JOIN）
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+-- 员工-部门关联（一人 N 部门）
+CREATE TABLE emp_dept (
+    emp_id      BIGINT       NOT NULL REFERENCES employee(id),
+    dept_id     BIGINT       NOT NULL REFERENCES department(id),
+    is_primary  BOOLEAN      NOT NULL DEFAULT FALSE,    -- 是否主部门
+    report_to   BIGINT       REFERENCES employee(id),   -- 该部门下的汇报上级
+    position    VARCHAR(100),                            -- 该部门的岗位/头衔
+    dept_path   VARCHAR(500) NOT NULL,                   -- 冗余 path，数据权限过滤用
+    started_at  DATE         NOT NULL DEFAULT CURRENT_DATE,  -- 加入日期
+    left_at     DATE,                                    -- 调离日期
+    PRIMARY KEY (emp_id, dept_id)
+);
+
+CREATE INDEX idx_emp_dept_emp   ON emp_dept(emp_id);
+CREATE INDEX idx_emp_dept_dept  ON emp_dept(dept_id);
+CREATE INDEX idx_emp_dept_path  ON emp_dept(dept_path);
 ```
 
-> `dept_path` 从部门表冗余到员工表，**查询时不用 JOIN**，数据权限过滤效率最高。
+> `dept_path` 冗余到 `emp_dept` 表，**数据权限过滤不走 employee 表，而是 JOIN emp_dept**。
+> 一个员工在 N 个部门就对应 N 行 emp_dept，数据权限的 WHERE 条件是 `ed.dept_path IN (...)` 的多路径匹配。
 
 ### 5.3 数据权限级别
 
@@ -490,6 +508,62 @@ public enum DataScope {
     SELF,         // 仅自己
     CUSTOM        // 自定义范围（扩展用）
 }
+
+public class EmployeePrincipal {
+
+    public DataScope getEffectiveDataScope() {
+        return userRoles.stream()
+            .map(Role::getDataScope)
+            .min(Comparator.comparingInt(DataScope::getLevel))
+            .orElse(DataScope.SELF);
+    }
+
+    // 可访问的部门路径列表（用于数据权限过滤）
+    public List<String> getAccessiblePaths() {
+        switch (getEffectiveDataScope()) {
+            case ALL:      return List.of("/");        // 全公司
+            case DEPT_TREE:
+            case DEPT:     return managedPaths;         // 来自 JWT
+            case SELF:     return List.of();            // 仅自己
+            default:       return List.of();
+        }
+    }
+}
+```
+
+**HRBP 管辖多部门的额外配置：**
+
+> DEPT_HEAD 的管辖部门 = 自己在 `emp_dept` 中关联的部门。
+> HRBP 的管辖部门可能需要跨部门配置（HRBP 不一定在这些部门里有任职记录）。
+
+```sql
+-- HRBP 管辖部门配置（一个人负责多个部门的 HR 事务）
+CREATE TABLE hrbp_dept (
+    emp_id      BIGINT       NOT NULL REFERENCES employee(id),
+    dept_id     BIGINT       NOT NULL REFERENCES department(id),
+    dept_path   VARCHAR(500) NOT NULL,
+    PRIMARY KEY (emp_id, dept_id)
+);
+```
+
+**JWT 中 `managed_paths` 的组装：**
+
+```java
+// 登录时，根据角色组装 managed_paths
+List<String> paths = new ArrayList<>();
+for (Role role : userRoles) {
+    switch (role.getDataScope()) {
+        case DEPT_TREE -> {
+            // 自己任职的部门（含子部门由 LIKE 查询自动覆盖）
+            paths.addAll(empDeptMapper.selectPathsByEmpId(empId));
+        }
+        case DEPT -> {
+            // HRBP：从 hrbp_dept 配置读取
+            paths.addAll(hrbpDeptMapper.selectPathsByEmpId(empId));
+        }
+    }
+}
+// 写入 JWT managed_paths: ["/1/10/", "/1/20/", "/2/"]
 
 public class EmployeePrincipal {
     // 取用户所有角色中的最大 data_scope
@@ -553,17 +627,18 @@ public class DataPermissionInterceptor implements InnerInterceptor {
 -- 原始 SQL
 SELECT * FROM employee WHERE status = 'ACTIVE' ORDER BY id
 
--- DEPT_TREE 范围自动注入后
-SELECT * FROM employee 
-WHERE status = 'ACTIVE' 
-  AND dept_path LIKE '/1/10/%'  -- ← 自动加上，用户部门路径 = /1/10/
-ORDER BY id
+-- DEPT_TREE 范围自动注入后（多部门 OR 条件 + JOIN emp_dept）
+SELECT e.* FROM employee e
+JOIN emp_dept ed ON ed.emp_id = e.id
+WHERE e.status = 'ACTIVE' 
+  AND ed.left_at IS NULL
+  AND (ed.dept_path LIKE '/1/10/%' OR ed.dept_path LIKE '/1/20/%')  -- 多个管辖部门
+ORDER BY e.id
 
 -- SELF 范围自动注入后
-SELECT * FROM employee 
-WHERE status = 'ACTIVE' 
-  AND id = 1001                 -- ← 自动加上，只查自己
-ORDER BY id
+SELECT e.* FROM employee e
+WHERE e.id = 1001                 -- 只查自己
+ORDER BY e.id
 ```
 
 **表级别控制：** 不是所有表都需要数据权限过滤。通过注解标记：
@@ -572,9 +647,9 @@ ORDER BY id
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
 public @interface DataScope {
-    String tableAlias() default "";       -- 表别名，如 e
-    String deptPathColumn() default "dept_path";   -- 部门路径字段名
-    String empIdColumn() default "id";              -- 员工ID字段名
+    String tableAlias() default "e";           -- 员工表别名
+    String deptPathColumn() default "ed.dept_path";  -- 部门路径字段（走 emp_dept 表）
+    String empIdColumn() default "e.id";             -- 员工ID字段
     boolean enable() default true;
 }
 ```
