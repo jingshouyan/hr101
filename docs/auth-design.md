@@ -129,41 +129,36 @@ public class SecurityConfig {
 
 ## 四、RBAC 权限模型
 
+### 设计思路
+
+HR 系统的权限有几个特点：
+- **角色极少且稳定**：总共 6 个角色，新增角色是低频事件
+- **权限编码是契约**：如 `employee:read`、`salary:calculate`，在代码中直接引用，不是用户动态创建的数据
+- **权限变更频率低**：几个月调一次，不需要运行时弹性的权限表
+
+因此：**权限编码不进数据库，放在 Java 常量中。角色和权限的映射关系合并到 role 表的一个 TEXT[] 字段。**
+
 ### 数据模型
 
 ```
-┌──────────┐     ┌────────────────┐     ┌──────────────┐
-│   用户    │────→│  用户-角色关联  │←────│    角色       │
-│ employee │     │  emp_role      │     │    role      │
-└──────────┘     └────────────────┘     └──────┬───────┘
-                                                │
-                                                │
-                                          ┌────▼───────┐
-                                          │  角色-权限   │
-                                          │  role_perm  │
-                                          └────┬───────┘
-                                                │
-                                          ┌────▼───────┐
-                                          │   权限       │
-                                          │  permission │
-                                          └────────────┘
+┌──────────┐     ┌────────────────┐     ┌──────────────────────┐
+│   用户    │────→│  用户-角色关联  │←────│   角色（含权限列表）   │
+│ employee │     │  emp_role      │     │   role               │
+└──────────┘     └────────────────┘     │   permissions TEXT[] │
+                                        └──────────────────────┘
 ```
 
 ```sql
--- 权限（最细粒度的操作单位）
-CREATE TABLE permission (
-    code        VARCHAR(100) PRIMARY KEY,  -- 如 employee:read
-    name        VARCHAR(100) NOT NULL,      -- 如 "查看员工"
-    module      VARCHAR(50)  NOT NULL       -- 所属模块
+-- 角色（权限合并为 TEXT[] 数组）
+CREATE TABLE role (
+    id            BIGSERIAL    PRIMARY KEY,
+    code          VARCHAR(50)  NOT NULL UNIQUE,  -- HR_MANAGER
+    name          VARCHAR(100) NOT NULL,
+    description   VARCHAR(500),
+    permissions   TEXT[]       NOT NULL DEFAULT '{}'  -- 如 {"employee:read","employee:write"}
 );
 
--- 角色
-CREATE TABLE role (
-    id          BIGSERIAL PRIMARY KEY,
-    code        VARCHAR(50)  NOT NULL UNIQUE,  -- HR_MANAGER
-    name        VARCHAR(100) NOT NULL,
-    description VARCHAR(500)
-);
+CREATE INDEX idx_role_perms ON role USING GIN (permissions);
 
 -- 用户-角色
 CREATE TABLE emp_role (
@@ -171,14 +166,105 @@ CREATE TABLE emp_role (
     role_id     BIGINT NOT NULL REFERENCES role(id),
     PRIMARY KEY (emp_id, role_id)
 );
-
--- 角色-权限
-CREATE TABLE role_permission (
-    role_id         BIGINT NOT NULL REFERENCES role(id),
-    permission_code VARCHAR(100) NOT NULL REFERENCES permission(code),
-    PRIMARY KEY (role_id, permission_code)
-);
 ```
+
+**权限查询：**
+
+```sql
+-- 查某用户的所有权限
+SELECT DISTINCT unnest(r.permissions)
+FROM emp_role er
+JOIN role r ON r.id = er.role_id
+WHERE er.emp_id = 1001;
+
+-- 结果：{"employee:read", "employee:write", "salary:read", ...}
+```
+
+**GIN 索引支持反向查询：**
+```sql
+-- 哪些角色包含 'employee:read' 权限？
+SELECT code FROM role WHERE permissions @> ARRAY['employee:read'];
+```
+
+### 权限编码（Java 常量）
+
+> 所有权限编码集中管理，不落数据库。
+
+```java
+public final class Permissions {
+
+    // ── 员工模块 ──
+    public static final String EMPLOYEE_READ   = "employee:read";
+    public static final String EMPLOYEE_WRITE  = "employee:write";
+    public static final String EMPLOYEE_DELETE = "employee:delete";
+    public static final String EMPLOYEE_EXPORT = "employee:export";
+
+    // ── 考勤模块 ──
+    public static final String ATTENDANCE_READ    = "attendance:read";
+    public static final String ATTENDANCE_WRITE   = "attendance:write";
+    public static final String ATTENDANCE_APPROVE = "attendance:approve";
+
+    // ── 薪资模块 ──
+    public static final String SALARY_READ      = "salary:read";
+    public static final String SALARY_CALCULATE = "salary:calculate";
+    public static final String SALARY_PAY       = "salary:pay";
+
+    // ── 审批模块 ──
+    public static final String APPROVAL_VIEW      = "approval:view";
+    public static final String APPROVAL_APPROVE   = "approval:approve";
+    public static final String APPROVAL_INTERVENE = "approval:intervene";
+
+    // ── 组织架构 ──
+    public static final String ORG_READ  = "org:read";
+    public static final String ORG_WRITE = "org:write";
+
+    // ── 系统管理 ──
+    public static final String SYS_USER   = "sys:user";
+    public static final String SYS_ROLE   = "sys:role";
+    public static final String SYS_CONFIG = "sys:config";
+}
+```
+
+### 角色与权限的绑定（初始化代码）
+
+> role 表数据通过代码初始化，建表时插入基础数据，后续通过 Flyway/Liquibase 管理变更。
+
+```java
+@Component
+public class RolePermissionInitializer implements CommandLineRunner {
+
+    private final RoleMapper roleMapper;
+
+    @Override
+    public void run(String... args) {
+        // 插入角色（幂等：存在则跳过）
+        insertRole("ADMIN",       "系统管理员",     Permissions.ALL);
+        insertRole("HR_MANAGER",  "HR 管理员",      Permissions.HR_FULL);
+        insertRole("HR_OPERATOR", "HR 专员",        Permissions.HR_OPERATE);
+        insertRole("HR_PAYROLL",  "HR 薪资专员",    Permissions.HR_PAYROLL);
+        insertRole("DEPT_HEAD",   "部门主管",       Permissions.DEPT_HEAD);
+        insertRole("EMPLOYEE",    "普通员工",       Permissions.EMPLOYEE);
+    }
+
+    private void insertRole(String code, String name, String[] permissions) {
+        if (roleMapper.selectByCode(code) == null) {
+            roleMapper.insert(new Role().setCode(code).setName(name).setPermissions(permissions));
+        }
+    }
+}
+```
+
+```java
+// 每个角色的权限集合（集中在 Permissions 类中维护）
+public static final String[] ALL        = {"employee:read", "employee:write", ..., "sys:config"};
+public static final String[] HR_FULL    = {"employee:read", "employee:write", ..., "attendance:approve"};
+public static final String[] HR_OPERATE = {"employee:read", "employee:write", "employee:export"};
+public static final String[] DEPT_HEAD  = {"employee:read", "attendance:read", "approval:view", "approval:approve"};
+public static final String[] EMPLOYEE   = {"employee:read", "attendance:read", "approval:view"};
+```
+
+> 权限变更时：修改 `Permissions.java` 中的数组 → 执行 `update role set permissions = ? where code = ?` → 生效。
+> 不需要建表、不需要外键、不需要中间表。
 
 ### 建议的 HR 角色
 
