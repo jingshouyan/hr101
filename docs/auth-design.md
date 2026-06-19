@@ -588,7 +588,101 @@ public class EmployeePrincipal {
 | HRBP | DEPT | 看所负责的部门 |
 | EMPLOYEE | SELF | 仅看自己 |
 
-### 5.4 核心实现：数据权限过滤器
+### 5.4 多部门对权限的全面影响
+
+> 一人多部门不是"多一个关联表"那么简单，它对功能权限、数据权限、业务归属、审批流向都有影响。
+
+#### 功能权限（无影响）
+
+功能权限由 `role.permissions` 控制（如 `employee:read`），它判断的是**能不能做某个操作**，不涉及归属哪个部门。多部门不改变这一点。
+
+#### 数据权限（直接影响）
+
+| 场景 | 过滤逻辑 | 示例 |
+|------|---------|------|
+| DEPT_HEAD 管多部门 | `ed.dept_path IN (多个路径) OR ...` | 管技术部和产品部，查两个部门的员工 |
+| HRBP 管多部门 | 同上，路径来自 `hrbp_dept` 表 | 负责事业部A和事业部B的 HR 事务 |
+| 员工看自己的数据 | 仍是 `e.id = ?` | 无变化，一人多部门不影响"看自己" |
+
+#### 业务记录的 dept_path 归属（关键设计）
+
+业务记录（请假单、工资单、考勤记录）**必须记录当时所属的部门路径**，原因有两个：
+
+```sql
+-- 所有业务表都需要 dept_path 字段，记录创建时的部门
+CREATE TABLE leave_request (
+    id          BIGSERIAL   PRIMARY KEY,
+    emp_id      BIGINT      NOT NULL,
+    dept_path   VARCHAR(500) NOT NULL,      -- ← 提交时的部门路径（历史快照）
+    leave_type  VARCHAR(20) NOT NULL,
+    start_date  DATE        NOT NULL,
+    end_date    DATE        NOT NULL,
+    status      VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 为什么不能 JOIN emp_dept 来查？
+-- 员工去年在 A 部门时提交的请假单，今年调到 B 部门了
+-- JOIN emp_dept 只能查到 B 部门，那条请假单就丢了
+-- 所以 dept_path 必须业务表自带，是业务发生时的快照
+```
+
+**所有需要数据权限过滤的业务表都需要 `dept_path`：**
+
+| 表 | dept_path 记录的是 | 举例 |
+|----|-------------------|------|
+| `leave_request` | 提交请假时的部门 | 2025年在A部门请的假，2026调B，仍归A部门主管管 |
+| `attendance_record` | 打卡当天的部门 | 按天归属，跨部门调动的考勤分属不同主管 |
+| `salary` | 薪资所属月份的最后所在部门 | 月度薪资发给当月所在部门审批 |
+| `performance_review` | 考核周期的部门 | 年度绩效归考核时所在的部门 |
+| `expense_report` | 报销时的部门 | 报销走当时部门的预算 |
+
+#### 审批流向（多部门场景的复杂度）
+
+当一个员工属于多个部门时，审批应该走哪个部门的审批链？
+
+```java
+// 请假审批：走主部门还是请假时所在的部门？
+// 规则：按业务记录中的 dept_path 确定审批链
+
+// 1. 员工在主部门 技术部 任职，同时在 架构部 兼职
+// 2. 员工提交请假单时，选择"请假期间的工作归属部门"
+// 3. 如果选择"架构部" → 请假单上的 dept_path = /1/20/（架构部路径）
+//    审批链 = 架构部主管 → HRBP（架构部）→ ...
+// 4. 如果选择"技术部" → dept_path = /1/10/（技术部路径）
+//    审批链 = 技术部主管 → HRBP（技术部）→ ...
+```
+
+```sql
+-- leave_request 需要额外一个字段表示"归属部门"的选择
+ALTER TABLE leave_request ADD COLUMN dept_id BIGINT REFERENCES department(id);
+-- dept_path 从该 dept_id 冗余，保持一致
+```
+
+**原则**：**业务记录按哪个部门提交，就走哪个部门的审批流和数据归属。** 多部门只是给了员工"选择以哪个身份发起"的自由。
+
+#### 管辖部门的精确范围（DEPT_TREE vs DEPT）
+
+多部门场景下，DEPT_TREE 和 DEPT 的差异更关键：
+
+```
+DEPT_TREE：看本部门及所有子部门
+  如技术部下有：前端组、后端组、测试组
+  DEPT_TREE = 看到技术部 + 前端组 + 后端组 + 测试组的所有人
+
+DEPT：仅看本部门
+  如技术部下有：前端组、后端组、测试组
+  DEPT = 只看技术部本部的人，不看下面小组
+
+当一个人管多个部门时，每个部门独立判断层级：
+  managed_paths = ["/1/10/", "/2/20/"]
+  DEPT_TREE → dept_path LIKE '/1/10/%' OR dept_path LIKE '/2/20/%'
+              每个部门都向下展开
+  DEPT      → dept_path IN ('/1/10/', '/2/20/')
+              只看精确的部门，不展开
+```
+
+### 5.5 核心实现：数据权限过滤器
 
 #### MyBatis-Plus 拦截器方式（推荐）
 
