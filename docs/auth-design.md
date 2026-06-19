@@ -46,9 +46,10 @@
   "sub": "1001",
   "emp_id": 1001,
   "name": "张三",
-  "primary_dept_id": 20,
-  "dept_ids": [20, 25],           // 所属所有部门 ID（含主部门）
-  "managed_paths": ["/1/10/"],   // 管辖的部门路径集合（DEPT_TREE/DEPT 角色用）
+  "active_employment_id": 1,           // 当前选中的用工关系
+  "legal_entity_code": "GROUP_A",      // 当前实体的编码
+  "managed_paths": ["GROUP_A/1/10/", "SUBSIDIARY_B/1/20/"],  // 管辖的路径（已含实体前缀）
+  "data_scope": "DEPT_TREE",           // 当前最大数据范围
   "type": "access",
   "iat": 1718000000,
   "exp": 1718000500     // 5 分钟后过期
@@ -461,40 +462,68 @@ SELECT id FROM department WHERE path ~ '1.10.*{1}';
 
 > **建议**：如果团队 PG 经验丰富 → **LTREE**；否则 → **物化路径**，功能够用且更通用。
 
-### 5.2 员工表中的权限相关字段
+### 5.2 员工、用工关系与任职
+
+> 完整模型见 `docs/org-people-design.md`。此处只摘取与权限相关的核心表。
+> 关键变化：**emp_dept 表拆解为 employment（用工关系）+ emp_position（任职）**。
 
 ```sql
--- 员工表（剥离部门归属，只保留最基本的个人属性）
+-- 人员（全局唯一，跨法人实体不重复）
 CREATE TABLE employee (
     id              BIGSERIAL    PRIMARY KEY,
     name            VARCHAR(50)  NOT NULL,
-    emp_type        VARCHAR(20)  NOT NULL,     -- REGULAR / OUTSOURCE / INTERN / ...
+    phone           VARCHAR(20),
+    email           VARCHAR(100),
     status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
-    primary_dept_id BIGINT       REFERENCES department(id),  -- 主部门（冗余，高频查询免 JOIN）
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- 员工-部门关联（一人 N 部门）
-CREATE TABLE emp_dept (
-    emp_id      BIGINT       NOT NULL REFERENCES employee(id),
-    dept_id     BIGINT       NOT NULL REFERENCES department(id),
-    is_primary  BOOLEAN      NOT NULL DEFAULT FALSE,    -- 是否主部门
-    report_to   BIGINT       REFERENCES employee(id),   -- 该部门下的汇报上级
-    position    VARCHAR(100),                            -- 该部门的岗位/头衔
-    dept_path   VARCHAR(500) NOT NULL,                   -- 冗余 path，数据权限过滤用
-    started_at  DATE         NOT NULL DEFAULT CURRENT_DATE,  -- 加入日期
-    left_at     DATE,                                    -- 调离日期
-    PRIMARY KEY (emp_id, dept_id)
+-- 法人实体（集团/子公司/分公司）
+CREATE TABLE legal_entity (
+    id              BIGSERIAL    PRIMARY KEY,
+    code            VARCHAR(50)  NOT NULL UNIQUE,  -- GROUP_A / SUBSIDIARY_B
+    name            VARCHAR(200) NOT NULL,
+    status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE'
 );
 
-CREATE INDEX idx_emp_dept_emp   ON emp_dept(emp_id);
-CREATE INDEX idx_emp_dept_dept  ON emp_dept(dept_id);
-CREATE INDEX idx_emp_dept_path  ON emp_dept(dept_path);
+-- 用工关系（连接人员与法人实体，一人可有多份：集团全职+子公司兼职）
+CREATE TABLE employment (
+    id                  BIGSERIAL    PRIMARY KEY,
+    emp_id              BIGINT       NOT NULL REFERENCES employee(id),
+    legal_entity_id     BIGINT       NOT NULL REFERENCES legal_entity(id),
+    employee_no         VARCHAR(50),            -- 在该法人下的工号
+    emp_type            VARCHAR(20)  NOT NULL,   -- REGULAR / DISPATCH / OUTSOURCE / INTERN
+    status              VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+    is_primary          BOOLEAN      NOT NULL DEFAULT FALSE,
+    UNIQUE (emp_id, legal_entity_id)
+);
+
+-- 任职（用工关系下的部门+岗位，替代原来的 emp_dept）
+CREATE TABLE emp_position (
+    id                BIGSERIAL    PRIMARY KEY,
+    employment_id     BIGINT       NOT NULL REFERENCES employment(id),
+    dept_id           BIGINT       NOT NULL REFERENCES department(id),
+    dept_path         VARCHAR(500) NOT NULL,       -- 冗余，权限过滤核心字段
+    position_name     VARCHAR(100),                 -- 岗位名称
+    report_to_emp_id  BIGINT       REFERENCES employee(id),  -- 汇报对象
+    report_type       VARCHAR(20)  NOT NULL DEFAULT 'SOLID', -- SOLID(实线) / DOTTED(虚线)
+    is_primary        BOOLEAN      NOT NULL DEFAULT FALSE,
+    started_at        DATE         NOT NULL,
+    left_at           DATE,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_pos_employment ON emp_position(employment_id);
+CREATE INDEX idx_pos_dept       ON emp_position(dept_id);
+CREATE INDEX idx_pos_dept_path  ON emp_position(dept_path);
 ```
 
-> `dept_path` 冗余到 `emp_dept` 表，**数据权限过滤不走 employee 表，而是 JOIN emp_dept**。
-> 一个员工在 N 个部门就对应 N 行 emp_dept，数据权限的 WHERE 条件是 `ed.dept_path IN (...)` 的多路径匹配。
+> `dept_path` 冗余到 `emp_position` 表，带 `legal_entity_code` 前缀，天然跨实体隔离：
+> - 集团总部技术部：`GROUP_A/1/10/`
+> - 子公司B技术部：`SUBSIDIARY_B/1/10/`
+>
+> **数据权限过滤统一走 `emp_position.dept_path`**。
 
 ### 5.3 数据权限级别
 
@@ -531,13 +560,12 @@ public class EmployeePrincipal {
 }
 ```
 
-**HRBP 管辖多部门的额外配置：**
+**HRBP 管辖多部门的配置：**
 
-> DEPT_HEAD 的管辖部门 = 自己在 `emp_dept` 中关联的部门。
-> HRBP 的管辖部门可能需要跨部门配置（HRBP 不一定在这些部门里有任职记录）。
+> DEPT_HEAD 的管辖部门 = 自己在 `emp_position` 中的部门（一个人可兼任多个部门主管）。
+> HRBP 的管辖部门需要单独配置（HRBP 不一定在这些部门里有任职）。
 
 ```sql
--- HRBP 管辖部门配置（一个人负责多个部门的 HR 事务）
 CREATE TABLE hrbp_dept (
     emp_id      BIGINT       NOT NULL REFERENCES employee(id),
     dept_id     BIGINT       NOT NULL REFERENCES department(id),
@@ -549,13 +577,14 @@ CREATE TABLE hrbp_dept (
 **JWT 中 `managed_paths` 的组装：**
 
 ```java
-// 登录时，根据角色组装 managed_paths
+// 登录时，根据角色和当前 employment 组装 managed_paths
 List<String> paths = new ArrayList<>();
 for (Role role : userRoles) {
     switch (role.getDataScope()) {
         case DEPT_TREE -> {
-            // 自己任职的部门（含子部门由 LIKE 查询自动覆盖）
-            paths.addAll(empDeptMapper.selectPathsByEmpId(empId));
+            // 取当前 employment 下所有任职的部门路径
+            List<Long> employmentIds = employmentMapper.selectIdsByEmpId(empId);
+            paths.addAll(positionMapper.selectPathsByEmploymentIds(employmentIds));
         }
         case DEPT -> {
             // HRBP：从 hrbp_dept 配置读取
@@ -563,7 +592,7 @@ for (Role role : userRoles) {
         }
     }
 }
-// 写入 JWT managed_paths: ["/1/10/", "/1/20/", "/2/"]
+// 写入 JWT managed_paths: ["GROUP_A/1/10/", "SUBSIDIARY_B/1/20/"]
 
 public class EmployeePrincipal {
     // 取用户所有角色中的最大 data_scope
@@ -600,7 +629,7 @@ public class EmployeePrincipal {
 
 | 场景 | 过滤逻辑 | 示例 |
 |------|---------|------|
-| DEPT_HEAD 管多部门 | `ed.dept_path IN (多个路径) OR ...` | 管技术部和产品部，查两个部门的员工 |
+| DEPT_HEAD 管多部门 | `pos.dept_path IN (多个路径) OR ...` | 管技术部和产品部，查两个部门的员工 |
 | HRBP 管多部门 | 同上，路径来自 `hrbp_dept` 表 | 负责事业部A和事业部B的 HR 事务 |
 | 员工看自己的数据 | 仍是 `e.id = ?` | 无变化，一人多部门不影响"看自己" |
 
@@ -721,12 +750,12 @@ public class DataPermissionInterceptor implements InnerInterceptor {
 -- 原始 SQL
 SELECT * FROM employee WHERE status = 'ACTIVE' ORDER BY id
 
--- DEPT_TREE 范围自动注入后（多部门 OR 条件 + JOIN emp_dept）
+-- DEPT_TREE 范围自动注入后（多部门 OR 条件，通过 employment 桥接）
 SELECT e.* FROM employee e
-JOIN emp_dept ed ON ed.emp_id = e.id
-WHERE e.status = 'ACTIVE' 
-  AND ed.left_at IS NULL
-  AND (ed.dept_path LIKE '/1/10/%' OR ed.dept_path LIKE '/1/20/%')  -- 多个管辖部门
+JOIN employment em ON em.emp_id = e.id AND em.status = 'ACTIVE'
+JOIN emp_position pos ON pos.employment_id = em.id AND pos.left_at IS NULL
+WHERE e.status = 'ACTIVE'
+  AND (pos.dept_path LIKE 'GROUP_A/1/10/%' OR pos.dept_path LIKE 'SUBSIDIARY_B/1/20/%')
 ORDER BY e.id
 
 -- SELF 范围自动注入后
@@ -742,7 +771,7 @@ ORDER BY e.id
 @Retention(RetentionPolicy.RUNTIME)
 public @interface DataScope {
     String tableAlias() default "e";           -- 员工表别名
-    String deptPathColumn() default "ed.dept_path";  -- 部门路径字段（走 emp_dept 表）
+    String deptPathColumn() default "pos.dept_path";  -- 部门路径字段（走 emp_position 表）
     String empIdColumn() default "e.id";             -- 员工ID字段
     boolean enable() default true;
 }
@@ -807,15 +836,8 @@ CREATE POLICY emp_self_policy ON employee
     USING (id = current_setting('app.current_emp_id')::BIGINT);
 
 -- 3. 部门主管看自己和下属的数据
-CREATE POLICY emp_dept_tree_policy ON employee
-    FOR SELECT
-    USING (
-        current_setting('app.data_scope') = 'DEPT_TREE'
-        AND dept_path LIKE (
-            SELECT path || '%' FROM department 
-            WHERE id = current_setting('app.dept_id')::BIGINT
-        )
-    );
+-- RLS 适用于单实体简单场景，多实体时建议在应用层控制
+-- 以下示例仅作参考，一期不启用
 ```
 
 **Java 端设置**：每次请求时，在 JWT 过滤器中设置 PostgreSQL session 变量：
@@ -845,29 +867,39 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
 ### 5.6 完整流程示例
 
-以 **"部门主管查看团队员工列表"** 为例：
+以 **"部门主管查看团队员工列表"** 为例（主管同时管集团技术部和子公司B架构部）：
 
 ```
-1. 用户登录
-   → JWT 中携带 dept_path = "/1/10/", data_scope = "DEPT_TREE"
+1. 用户登录，选择当前身份"集团总部·技术总监"
+   → 后端查 employment + emp_position
+   → JWT 中携带：
+     {
+       "emp_id": 1001,
+       "active_employment_id": 1,
+       "managed_paths": ["GROUP_A/1/10/", "SUBSIDIARY_B/1/20/"],
+       "data_scope": "DEPT_TREE"
+     }
 
 2. 前端请求 GET /api/employees?page=1&size=20
 
 3. JWT 过滤器解析 token，设置 SecurityContext
-   → principal.deptPath = "/1/10/"
+   → principal.managedPaths = ["GROUP_A/1/10/", "SUBSIDIARY_B/1/20/"]
    → principal.dataScope = "DEPT_TREE"
 
 4. EmployeeMapper.selectPage() 执行
    → DataPermissionInterceptor 拦截 SQL
-   → 注入 WHERE dept_path LIKE '/1/10/%'
+   → 注入 JOIN + WHERE
    → 最终 SQL:
-       SELECT * FROM employee 
-       WHERE status = 'ACTIVE' 
-         AND dept_path LIKE '/1/10/%'    ← 自动注入
-       ORDER BY id
+       SELECT e.* FROM employee e
+       JOIN employment em ON em.emp_id = e.id AND em.status = 'ACTIVE'
+       JOIN emp_position pos ON pos.employment_id = em.id AND pos.left_at IS NULL
+       WHERE e.status = 'ACTIVE'
+         AND (pos.dept_path LIKE 'GROUP_A/1/10/%' OR pos.dept_path LIKE 'SUBSIDIARY_B/1/20/%')
+       ORDER BY e.id
        LIMIT 20 OFFSET 0
 
-5. 结果：主管看到自己部门及所有下级部门的员工
+5. 结果：主管看到集团技术部 + 子公司B架构部及各自下属部门的员工
+   （两个实体的数据天然隔离，不会互相泄漏）
 ```
 
 ### 5.7 各业务模块的数据权限矩阵
