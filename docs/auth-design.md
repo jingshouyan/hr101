@@ -12,34 +12,21 @@
 > 需要先选择以哪个身份操作，JWT 中的 `active_employment_id` 决定数据范围。
 
 ```
-┌──────────┐       ┌───────────────────┐       ┌──────────────┐
-│  前端     │──1──→│  登录接口           │──3──→│  人员服务      │
-│  Vue 3   │       │  POST /auth/login  │       │  Employee    │
-│          │←─2───│  验证身份            │       │  (查密码)     │
-│          │       │  ↓                  │       └──────────────┘
-│          │       │  查询该人的所有      │
-│          │       │  employment 列表    │
-│          │       │  ↓                  │
-│          │       │  返回身份选择页      │
-│          │       │  (集团总部·技术总监   │
-│          │       │   子公司B·架构师)    │
-│          │       └────────────────────┘
-│          │                │
-│          │  选择身份后     │
-│          ▼               ▼
-│  ┌──────────┐       ┌──────────────────┐
-│  │  业务接口  │←─────│  签发 JWT        │
-│  │  Header:  │       │  emp_id +       │
-│  │  Bearer   │       │  active_empl_id │
-│  │  xxx      │       │  managed_paths  │
-│  └──────────┘       └──────────────────┘
-│          │
-│          ▼
-│  ┌──────────────────┐
-│  │  JWT 过滤器       │
-│  │  解析 token       │
-│  │  设 SecurityCtx  │
-│  └──────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  1. POST /auth/login                                     │
+│     ↓ 验证密码                                           │
+│     ↓ 签发半令牌（PENDING, scope=仅选身份+退出）          │
+│     ↓ 返回身份列表                                        │
+├──────────────────────────────────────────────────────────┤
+│  2. 用户选择身份                                          │
+│     ↓ POST /auth/select-identity  (Header: Bearer 半令牌) │
+│     ↓ 校验半令牌有效 → 签发完整 JWT（含 active_empl_id）  │
+├──────────────────────────────────────────────────────────┤
+│  3. ANT 业务接口                                         │
+│     Header: Bearer 完整 JWT                               │
+│     → JWT 过滤器校验 scope=*                             │
+│     → @PreAuthorize + 数据权限过滤                       │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## 二、JWT 令牌设计
@@ -76,40 +63,75 @@
 
 ### 身份选择
 
-一个人有多份 employment 时，登录后需要选择本次操作的身份：
+一个人有多份 employment 时，登录后需要选择本次操作的身份。
+
+**流程：登录先发半令牌 → 选择身份后换发完整令牌**
 
 ```
 POST /auth/login
   ↓  验证账号密码
   ↓  查询该人的所有 employment（多实体、多部门）
-  ↓  返回可选身份列表
+  ↓  签发半令牌 + 返回身份列表
 
 响应：
 {
-  "access_token": null,    // 暂不签发
+  "access_token": "eyJhbGc...",      // ← 有效 JWT，但 scope 受限
+  "token_type": "PENDING_IDENTITY",  // ← 标记尚未选择身份
   "identities": [
     { "employment_id": 1, "legal_entity": "集团总部", "position": "技术总监" },
-    { "employment_id": 2, "legal_entity": "子公司B",  "position": "架构师(兼)" },
-    { "employment_id": 3, "legal_entity": "XX项目",   "role": "技术负责人" }
+    { "employment_id": 2, "legal_entity": "子公司B",  "position": "架构师(兼)" }
   ]
-}
-
-前端：展示身份选择器 → 用户点击一个身份
-  ↓
-POST /auth/select-identity { "employment_id": 1 }
-  ↓  签发 access_token（含 active_employment_id + managed_paths）
-
-JWT:
-{
-  "emp_id": 1001,
-  "active_employment_id": 1,
-  "managed_paths": ["GROUP_A/1/10/"],
-  "exp": 5min
 }
 ```
 
-> 如果用户只有一份 employment，跳过身份选择步骤，直接签发 token。
-> 切换身份：前端调用 `POST /auth/switch-identity`，后端重新签发 token。
+**半令牌的特点：**
+
+```json
+{
+  "emp_id": 1001,              // 人已认证
+  "token_type": "PENDING",     // 未选择身份
+  "scope": ["auth:select-identity", "auth:logout"],  // 仅能调用身份选择和退出
+  "exp": 300                   // 5 分钟
+}
+```
+
+- 半令牌是**已认证的合法 JWT**，但 RESTRICTED scope
+- 只能调用 `POST /auth/select-identity` 和 `POST /auth/logout`
+- 调用其他 API 一律返回 403（scope 不足）
+- 5 分钟过期，超时未选择身份需要重新登录
+
+```
+前端展示身份选择器 → 用户点击一个身份
+  ↓
+POST /auth/select-identity       ← Header: Bearer 半令牌
+Body: { "employment_id": 1 }
+  ↓  服务端校验半令牌有效
+  ↓  签发完整 access_token
+
+响应：
+{
+  "access_token": "eyJhbGc...",  // 完整 JWT
+  "token_type": "FULL",
+  "refresh_token": "xxx"         // 同时签发 refresh_token
+}
+```
+
+**完整令牌：**
+
+```json
+{
+  "emp_id": 1001,
+  "active_employment_id": 1,       // ← 身份已选定
+  "legal_entity_code": "GROUP_A",
+  "managed_paths": ["GROUP_A/1/10/"],
+  "data_scope": "DEPT_TREE",
+  "scope": ["*"],                   // 完整权限
+  "exp": 300                        // 5 分钟
+}
+```
+
+> **如果用户只有一份 employment**：登录后直接签发完整令牌，跳过身份选择步骤。
+> **切换身份**：前端调用 `POST /auth/switch-identity { employment_id }`，用当前完整令牌换发新的完整令牌（切到另一个身份）。
 
 ### 刷新流程
 
