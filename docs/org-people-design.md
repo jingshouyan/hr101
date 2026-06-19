@@ -62,6 +62,33 @@
 
 ## 二、核心表设计
 
+### employee（人员 / 人）
+
+> **"人"是系统的最顶层实体，独立于任何用工关系存在。**
+> 一个人即使当前没有 employment（如离职状态、候选人），仍然在系统中有记录。
+> 认证（登录）是"人"级别的 —— 输入账号密码的是这个人，登录后再选择以哪份用工关系操作。
+
+```sql
+CREATE TABLE employee (
+    id              BIGSERIAL    PRIMARY KEY,
+    name            VARCHAR(50)  NOT NULL,
+    phone           VARCHAR(20),
+    email           VARCHAR(100),
+    password_hash   VARCHAR(255) NOT NULL,       -- 登录密码（BCrypt）
+    status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / INACTIVE / LOCKED
+    source          VARCHAR(20)  DEFAULT 'IMPORT',  -- IMPORT / REGISTER / RECRUIT
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX idx_emp_phone ON employee(phone) WHERE phone IS NOT NULL;
+CREATE UNIQUE INDEX idx_emp_email ON employee(email) WHERE email IS NOT NULL;
+```
+
+> `employee` 就是"人"，不管他当前有没有 employment、在哪个法人实体。
+> 一个人离职后，`employee` 记录保留，`employment` 标记为 TERMINATED。
+> 未来如果这个人重新入职，只需要新建一条 employment，不需要重新建人。
+
 ### legal_entity（法人实体 / 用工主体）
 
 > 集团下的每个子公司、分公司都是一个独立的 legal_entity。

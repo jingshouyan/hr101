@@ -7,27 +7,39 @@
 
 ## 一、整体架构
 
+> 认证是"人"级别的：**人（employee）登录 → 选择用工身份（employment）→ 按身份执行操作**。
+> 一个人登录后，如果有多份 employment（如集团全职+子公司兼职），
+> 需要先选择以哪个身份操作，JWT 中的 `active_employment_id` 决定数据范围。
+
 ```
-┌──────────┐       ┌──────────────────┐       ┌──────────────┐
-│  前端     │──1──→│  登录接口          │──3──→  │  用户服务      │
-│  Vue 3   │       │  POST /auth/login │       │  Employee    │
-│          │←─2───│  返回 access_token │       └──────────────┘
-│          │       │  + refresh_token  │             │
-│          │       └──────────────────┘             │
-│          │                                         ▼
-│          │       ┌──────────────────┐       ┌──────────────┐
-│          │──4──→│  业务接口          │──5──→│  JWT 过滤器    │
-│          │       │  Header:          │       │  解析 token   │
-│          │       │  Authorization:   │       │  提取用户信息  │
-│          │       │  Bearer xxx       │       │  设置 Security-│
-│          │       └──────────────────┘       │  Context      │
-│          │                                   └──────┬───────┘
-│          │                                           ▼
-│          │                                   ┌──────────────┐
-│          │                                   │  权限校验      │
-│          │                                   │  @PreAuthorize│
-│          │                                   │  + 数据权限   │
-│          │                                   └──────────────┘
+┌──────────┐       ┌───────────────────┐       ┌──────────────┐
+│  前端     │──1──→│  登录接口           │──3──→│  人员服务      │
+│  Vue 3   │       │  POST /auth/login  │       │  Employee    │
+│          │←─2───│  验证身份            │       │  (查密码)     │
+│          │       │  ↓                  │       └──────────────┘
+│          │       │  查询该人的所有      │
+│          │       │  employment 列表    │
+│          │       │  ↓                  │
+│          │       │  返回身份选择页      │
+│          │       │  (集团总部·技术总监   │
+│          │       │   子公司B·架构师)    │
+│          │       └────────────────────┘
+│          │                │
+│          │  选择身份后     │
+│          ▼               ▼
+│  ┌──────────┐       ┌──────────────────┐
+│  │  业务接口  │←─────│  签发 JWT        │
+│  │  Header:  │       │  emp_id +       │
+│  │  Bearer   │       │  active_empl_id │
+│  │  xxx      │       │  managed_paths  │
+│  └──────────┘       └──────────────────┘
+│          │
+│          ▼
+│  ┌──────────────────┐
+│  │  JWT 过滤器       │
+│  │  解析 token       │
+│  │  设 SecurityCtx  │
+│  └──────────────────┘
 ```
 
 ## 二、JWT 令牌设计
@@ -62,18 +74,53 @@
 > - 短 TTL（5-15 分钟）减少泄漏风险，权限变更最多延迟一个 token 生命周期
 > - token 不存敏感信息（手机号、身份证等）
 
+### 身份选择
+
+一个人有多份 employment 时，登录后需要选择本次操作的身份：
+
+```
+POST /auth/login
+  ↓  验证账号密码
+  ↓  查询该人的所有 employment（多实体、多部门）
+  ↓  返回可选身份列表
+
+响应：
+{
+  "access_token": null,    // 暂不签发
+  "identities": [
+    { "employment_id": 1, "legal_entity": "集团总部", "position": "技术总监" },
+    { "employment_id": 2, "legal_entity": "子公司B",  "position": "架构师(兼)" },
+    { "employment_id": 3, "legal_entity": "XX项目",   "role": "技术负责人" }
+  ]
+}
+
+前端：展示身份选择器 → 用户点击一个身份
+  ↓
+POST /auth/select-identity { "employment_id": 1 }
+  ↓  签发 access_token（含 active_employment_id + managed_paths）
+
+JWT:
+{
+  "emp_id": 1001,
+  "active_employment_id": 1,
+  "managed_paths": ["GROUP_A/1/10/"],
+  "exp": 5min
+}
+```
+
+> 如果用户只有一份 employment，跳过身份选择步骤，直接签发 token。
+> 切换身份：前端调用 `POST /auth/switch-identity`，后端重新签发 token。
+
 ### 刷新流程
 
 ```
 access_token 过期 → API 返回 401
   └→ 前端调用 POST /auth/refresh（携带 refresh_token Cookie）
-      ├→ 成功：从 DB 重新查询权限 → 签发新 access_token
+      ├→ 成功：从 DB 重新查询权限 → 签发新 access_token（保留 active_employment_id）
       └→ 失败：跳转登录页
 ```
 
-> 刷新时后端从 `emp_role` + `role_permission` 重新加载权限，
-> 所以新签发的 access_token 总是携带最新的权限。
-> 权限变更最多延迟一个 access_token 的生命周期（5-15 分钟）。
+> 刷新时保留原有的 `active_employment_id`，只重新加载该身份下的权限和数据范围。
 
 ## 三、Spring Security 配置
 
@@ -462,19 +509,21 @@ SELECT id FROM department WHERE path ~ '1.10.*{1}';
 
 > **建议**：如果团队 PG 经验丰富 → **LTREE**；否则 → **物化路径**，功能够用且更通用。
 
-### 5.2 员工、用工关系与任职
+### 5.2 人员、用工关系与任职
 
 > 完整模型见 `docs/org-people-design.md`。此处只摘取与权限相关的核心表。
-> 关键变化：**emp_dept 表拆解为 employment（用工关系）+ emp_position（任职）**。
+> 关键分层：**人（employee）→ 用工关系（employment）→ 任职（emp_position）**。
+> 认证是"人"级别的 —— 人先登录，再选择以哪份 employment 操作。
 
 ```sql
--- 人员（全局唯一，跨法人实体不重复）
+-- 人（全局唯一，跨法人实体不重复。一个人离职后记录保留，重新入职只加 employment）
 CREATE TABLE employee (
     id              BIGSERIAL    PRIMARY KEY,
     name            VARCHAR(50)  NOT NULL,
     phone           VARCHAR(20),
     email           VARCHAR(100),
-    status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+    password_hash   VARCHAR(255) NOT NULL,       -- 登录密码（BCrypt）
+    status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / INACTIVE / LOCKED
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
