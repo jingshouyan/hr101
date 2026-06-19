@@ -185,8 +185,9 @@
 
 ### 16. 系统管理
 
-- **用户管理**：账号、角色分配、启用/禁用
-- **角色权限**：RBAC，功能权限 + 数据权限（按部门 / 按岗位）
+- **用户管理**：人级账号、半令牌→完整令牌身份选择流程、登录日志
+- **角色权限**：RBAC 功能权限（`role.permissions TEXT[]`）+ 数据权限（`role.data_scope` 字段：ALL / DEPT_TREE / DEPT / SELF）
+- **法人实体管理**：集团/子公司/分公司的注册与配置（legal_entity）
 - **操作日志**：关键操作记录、可追溯
 - **系统配置**：参数配置（考勤规则 / 薪资项 / 审批流程等）
 - **消息通知**：站内信、邮件、企微/钉钉推送
@@ -360,6 +361,46 @@ MVP      Redis Stream  ✅  够用（操作日志 + 简单通知）
 > ```
 > 后续前后端都稳定后，随时可以把 `backend/` 和 `frontend/` 拆成独立仓库，git 历史可以通过 `git filter-repo` 保留。
 
+### 3.9 人员与组织模型（讨论后确定）
+
+> 经过多轮讨论，确定以 **人（employee）→ 用工关系（employment）→ 任职（emp_position）** 三层模型替代传统的一对多部门关联。
+> 详细设计见 `docs/org-people-design.md` 和 `docs/auth-design.md`。
+
+#### 核心变化
+
+| 旧模型（常见 HR 系统） | 新模型 |
+|----------------------|--------|
+| `employee.dept_id`（单部门） | `employee`（人，全局唯一）→ `employment`（用工关系）→ `emp_position`（任职） |
+| 一人一个工号 | 一人可在多个法人实体下有不同工号 |
+| 组织架构单棵树 | 每个法人实体一棵组织树，路径带实体前缀 |
+| 部门关联 = 汇报线 | 任职中 `report_type` 区分实线/虚线，支持矩阵管理 |
+
+#### 覆盖的场景
+
+| 场景 | 模型支持 |
+|------|---------|
+| **集团内兼职** | 一人多条 employment，关联不同 legal_entity |
+| **多主体用工** | employment 的 `payroll_entity_id` / `social_ins_entity_id` 各自独立 |
+| **矩阵式项目** | `emp_project` + `report_type = SOLID/DOTTED` |
+| **一人多部门** | `emp_position` 多行，不同部门不同汇报上级 |
+| **跨实体查重** | `employee.id_card_no` 全局唯一，查重接口限频+掩码 |
+
+#### 落地分期
+
+| 阶段 | 包含 | 不包含 |
+|------|------|--------|
+| **一期** | 表按设计全建（字段 nullable） + 单实体 + 单部门 + SOLID 汇报 | 多实体、多部门、项目矩阵 |
+| **二期** | 多 legal_entity + 多部门 + HRBP | 项目矩阵 |
+| **三期** | project + emp_project + 多主体发薪 + 身份切换 UI | — |
+
+#### 数据权限原则
+
+- 认证是 **"人"级别**：先登录，再选择以哪份 employment 操作
+- access_token 短 TTL + 不放权限列表，权限实时查 DB
+- `data_scope` 是 role 表字段（ALL / DEPT_TREE / DEPT / SELF）
+- 组织树 dept_path 带 legal_entity 前缀，天然跨实体隔离
+- 业务表自带 `dept_path` 快照，不 JOIN 当前任职
+
 ### 3.10 推荐组合（已确认）
 
 ```
@@ -432,9 +473,11 @@ JDK 27 (LTS)  — 2026年9月预计 → 如果项目年底才启动可等这个
 
 - **技术栈**：Spring Boot 4.1 + JDK 25 (LTS) + Vue 3 + PostgreSQL + Docker Compose
 - **ORM**：MyBatis-Plus
-- **认证**：JWT（Spring Security + jjwt）
+- **认证**：JWT（Spring Security + jjwt）—— 人级别认证 + employment 身份选择，半令牌→完整令牌流程
 - **审批引擎**：自研轻量引擎
 - **架构**：Monorepo + 一期单体模块化
+- **人员与组织模型**：三层架构 —— 人（employee）→ 用工关系（employment）→ 任职（emp_position），支持集团内兼职 / 多主体用工 / 矩阵式项目组织
+- **数据权限**：role 表的 `data_scope` 字段 + `emp_position.dept_path`（带 legal_entity 前缀）多路径过滤
 
 ### 仍需讨论
 
