@@ -286,7 +286,107 @@ CREATE TABLE emp_project (
 
 ---
 
-## 三、典型场景完整流程
+## 三、跨实体人员管理
+
+> `employee` 是全局的，但各实体的 HR 只能管理自己实体的人。
+> 核心矛盾：**避免重复建人 + 数据隔离**。
+
+### 3.1 人员的可见范围
+
+```
+集团总部 HR      → 可见全集团 person（集团管控视角）
+子公司 HR        → 仅可见本实体有 employment 的 person
+                  + 可按身份证号搜索查重
+                  + 查重结果不暴露详情
+普通员工         → 只能看到自己
+```
+
+**数据隔离的 SQL：**
+
+```sql
+-- 子公司 HR 查 person 列表 → 只查自己实体的
+SELECT e.* FROM employee e
+WHERE EXISTS (
+    SELECT 1 FROM employment em
+    WHERE em.emp_id = e.id
+      AND em.legal_entity_id = :current_entity_id
+      AND em.status = 'ACTIVE'
+);
+```
+
+### 3.2 身份证号 —— 全局查重依据
+
+```sql
+-- person 表增加身份证号（全局唯一，跨实体去重）
+ALTER TABLE employee ADD COLUMN id_card_no VARCHAR(18) UNIQUE;
+ALTER TABLE employee ADD COLUMN id_card_hash VARCHAR(64);  -- 哈希，合规场景用
+```
+
+> 身份证号是全局去重的核心。不同子公司用身份证号比对是否同一人。
+> 隐私合规：可只存哈希，查重时比对哈希值。
+
+### 3.3 子公司 HR 添加人的流程
+
+**场景：子公司B 招聘了一名新员工 "李四"**
+
+```
+子公司B HR 打开"新增人员"页面
+  ↓
+1. 输入身份证号 / 手机号
+  ↓
+2. 系统全库搜索：
+   - 找到匹配 person → "已在系统中（集团总部·张三），
+     是否为其创建子公司B的用工关系？"
+   - 未找到 → 进入新建 person 页面
+  ↓
+   新建 person：姓名、手机、身份证号、邮箱
+  ↓
+3. 创建 employment（自动关联当前 legal_entity_id = 子公司B）
+   工号、用工类型、入职日期、合同类型
+  ↓
+4. 创建 position（部门、岗位、汇报对象）
+  ↓
+5. 完成 → 李四在子公司B的组织树下可见
+```
+
+**接口设计：**
+
+```http
+POST /api/employees/check-duplicate
+  Authorization: Bearer xxx        ← 必须登录
+  Rate-Limit: 100/hour             ← 限频防爬
+  { "id_card_no_hash": "abc123..." }
+  → { "exists": false }
+  → { "exists": true, "masked_name": "张*", "entities": ["集团总部"] }
+
+POST /api/employees  （新建 person + employment + position）
+  {
+    "person": { "name": "李四", "phone": "138...", "id_card_no": "110101..." },
+    "employment": { "emp_type": "REGULAR", "hire_date": "2026-07-01" },
+    "position": { "dept_id": 20, "position_name": "开发工程师", "report_to_emp_id": 50 }
+  }
+
+POST /api/employees/{id}/employments  （已有 person，新增用工关系）
+  {
+    "employment": { "emp_type": "PART_TIME", "hire_date": "2026-07-01" },
+    "position": { "dept_id": 25, "position_name": "架构师" }
+  }
+```
+
+### 3.4 集团 HR vs 子公司 HR 的操作范围
+
+| 操作 | 集团 HR | 子公司 HR |
+|------|---------|----------|
+| 查看本实体人员 | ✅ 全集团 | ✅ 仅本实体 |
+| 新增 person | ✅（关联自己的实体） | ✅（关联自己的实体） |
+| 编辑 person 基本信息 | ✅ 全局覆盖 | ⚠️ 仅限本实体 employment 的人 |
+| 创建 employment | ✅ 可为任何实体创建 | ✅ 仅限自己的实体 |
+| 修改 employment/position | ✅ 任何实体 | ✅ 仅限自己的实体 |
+| 终止 employment（离职） | ✅ 任何实体 | ✅ 仅限自己的实体 |
+| 删除 person | ❌（只能禁用） | ❌（只能禁用） |
+| 跨实体查重 | ✅ | ✅（仅返回 masked 信息） |
+
+## 四、典型场景完整流程
 
 ### 场景 1：集团内兼职
 
@@ -364,7 +464,7 @@ CREATE TABLE emp_project (
 
 ---
 
-## 四、数据权限变化
+## 五、数据权限变化
 
 ### dept_path 前缀规则
 
@@ -406,7 +506,7 @@ WHERE (ed.dept_path LIKE 'GROUP_A/1/10/%' OR ed.dept_path LIKE 'SUBSIDIARY_B/1/2
 
 ---
 
-## 五、员工端 UI 影响
+## 六、员工端 UI 影响
 
 ### 身份选择器
 
@@ -430,7 +530,7 @@ WHERE (ed.dept_path LIKE 'GROUP_A/1/10/%' OR ed.dept_path LIKE 'SUBSIDIARY_B/1/2
 
 ---
 
-## 六、一期 MVP 简化建议
+## 七、一期 MVP 简化建议
 
 这个模型很全，但一期不需要全部实现：
 
