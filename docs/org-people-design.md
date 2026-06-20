@@ -74,20 +74,26 @@ CREATE TABLE employee (
     name            VARCHAR(50)  NOT NULL,
     phone           VARCHAR(20),
     email           VARCHAR(100),
-    password_hash   VARCHAR(255) NOT NULL,       -- 登录密码（BCrypt）
+    id_card_no      VARCHAR(18)  UNIQUE,            -- 身份证号（全局去重依据）
+    id_card_hash    VARCHAR(64),                     -- 身份证哈希（合规场景替代明文）
+    password_hash   VARCHAR(255) NOT NULL,           -- 登录密码（BCrypt）
     status          VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / INACTIVE / LOCKED
-    source          VARCHAR(20)  DEFAULT 'IMPORT',  -- IMPORT / REGISTER / RECRUIT
+    source          VARCHAR(20)  DEFAULT 'IMPORT',           -- IMPORT / REGISTER / RECRUIT
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX idx_emp_phone ON employee(phone) WHERE phone IS NOT NULL;
-CREATE UNIQUE INDEX idx_emp_email ON employee(email) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX idx_emp_phone     ON employee(phone) WHERE phone IS NOT NULL;
+CREATE UNIQUE INDEX idx_emp_email     ON employee(email) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX idx_emp_id_card   ON employee(id_card_no) WHERE id_card_no IS NOT NULL;
 ```
 
 > `employee` 就是"人"，不管他当前有没有 employment、在哪个法人实体。
 > 一个人离职后，`employee` 记录保留，`employment` 标记为 TERMINATED。
 > 未来如果这个人重新入职，只需要新建一条 employment，不需要重新建人。
+>
+> **身份证号是全局去重的核心**：不同子公司的人用身份证号比对是否为同一人。
+> 隐私合规场景可仅存 `id_card_hash`，查重时比对哈希值，不传明文。
 
 ### legal_entity（法人实体 / 用工主体）
 
@@ -286,12 +292,106 @@ CREATE TABLE emp_project (
 
 ---
 
-## 三、跨实体人员管理
+## 三、实体关系与业务规则
+
+### 3.1 实体关系总图
+
+```
+┌──────────┐       ┌──────────────────┐       ┌──────────────┐
+│  person   │──1:N→│   employment     │──1:N→│  emp_position│
+│ (employee)│       │  (用工关系)       │       │  (任职)       │
+└──────────┘       └────────┬─────────┘       └──────┬───────┘
+       │                    │                         │
+       │                    │ N:1                     │ N:1
+       │                    ▼                         ▼
+       │           ┌──────────────────┐       ┌──────────────┐
+       │           │  legal_entity    │       │  department  │
+       │           │  (法人实体)       │←──1:N─│  (部门)       │
+       │           └──────────────────┘       └──────────────┘
+       │
+       │ 1:N               N:N
+       └─────────────┐  ┌──────────┐
+                     ▼  ▼          │
+              ┌────────────────┐   │
+              │  emp_project   │───│──→ project
+              │  (项目分配)     │   │   (项目)
+              └────────────────┘   │
+                                   │
+              ┌────────────────┐   │
+              │  hrbp_dept     │───┘
+              │  (HRBP 管辖)    │
+              └────────────────┘
+```
+
+**关键基数约束：**
+
+| 关系 | 基数 | 约束 |
+|------|------|------|
+| person → employment | 1:N | 一个人可有多份，但 `UNIQUE(emp_id, legal_entity_id)` — 同法人下只能有一份 |
+| employment → emp_position | 1:N | 一份用工可有多个任职（多部门、多岗位） |
+| emp_position → department | N:1 | 多个任职可属于同一部门（不同的人） |
+| department → legal_entity | N:1 | 每个法人有自己的组织树 |
+| person → emp_project | 1:N | 一个人可参与多个项目 |
+| emp_project → project | N:1 | 一个项目可有多个成员 |
+
+### 3.2 术语定义
+
+| 术语 | 英文 | 表 | 含义 |
+|------|------|-----|------|
+| **人** | Person | `employee` | 自然人的系统记录，全局唯一，独立于任何用工关系 |
+| **法人实体** | Legal Entity | `legal_entity` | 集团/子公司/分公司，每个实体有独立组织树和发薪体系 |
+| **用工关系** | Employment | `employment` | 连接人与法人的法律关系，一人可有多份 |
+| **任职** | Position | `emp_position` | 人在某部门的具体岗位+汇报线，一份用工可有多个 |
+| **实线汇报** | Solid Line | `report_type=SOLID` | 管绩效考评、晋升、薪资调整 |
+| **虚线汇报** | Dotted Line | `report_type=DOTTED` | 管日常工作、任务分配 |
+| **身份选择** | Identity Selection | — | 多 employment 用户登录后选择以哪份身份操作 |
+
+### 3.3 核心状态机
+
+**person 状态流转：**
+
+```
+ACTIVE ←→ INACTIVE
+ ACTIVE  → LOCKED
+ INACTIVE → TERMINATED（极少使用）
+```
+
+- `ACTIVE`：正常
+- `INACTIVE`：无任何 active employment（离职待处理）
+- `LOCKED`：账号锁定，无法登录
+- `TERMINATED`：彻底终止（仅集团 HR 操作）
+
+**employment 状态流转：**
+
+```
+ACTIVE → SUSPENDED → ACTIVE（恢复）
+ACTIVE → TERMINATED（离职）
+```
+
+- employment → TERMINATED 时，其所有 position 自动设 `left_at = now()`
+
+### 3.4 关键业务规则
+
+| # | 规则 | 说明 |
+|---|------|------|
+| 1 | **一人一实体一用工** | `UNIQUE(emp_id, legal_entity_id)` — 同一人在同一法人下只能有一份 employment |
+| 2 | **跨实体兼职** | 同一人可凭不同 employment 在不同法人下工作 |
+| 3 | **用工终止→任职结束** | employment 标记 TERMINATED 时，所有 position 自动 `left_at = now()` |
+| 4 | **身份证号全局唯一** | `id_card_no UNIQUE` + 查重接口，防同一人重复录入 |
+| 5 | **查重防遍历** | `check-duplicate` 须登录 + 限频 + 返回 masked 信息 |
+| 6 | **离职不删人** | person 记录永久保留，重新入职只加 employment |
+| 7 | **任职历史可追溯** | `started_at` / `left_at` 记录变迁，不删除历史行 |
+| 8 | **项目分配独立于任职** | emp_project 不依赖 emp_position，项目角色可与部门岗位不同 |
+| 9 | **实线唯一** | 同一 employment 下只能有一条 SOLID 汇报线（可有多个 DOTTED） |
+
+---
+
+## 四、跨实体人员管理
 
 > `employee` 是全局的，但各实体的 HR 只能管理自己实体的人。
 > 核心矛盾：**避免重复建人 + 数据隔离**。
 
-### 3.1 人员的可见范围
+### 4.1 人员的可见范围
 
 ```
 集团总部 HR      → 可见全集团 person（集团管控视角）
@@ -314,18 +414,11 @@ WHERE EXISTS (
 );
 ```
 
-### 3.2 身份证号 —— 全局查重依据
+### 4.2 身份证号 —— 全局查重依据
 
-```sql
--- person 表增加身份证号（全局唯一，跨实体去重）
-ALTER TABLE employee ADD COLUMN id_card_no VARCHAR(18) UNIQUE;
-ALTER TABLE employee ADD COLUMN id_card_hash VARCHAR(64);  -- 哈希，合规场景用
-```
+> 见 `employee` 表定义（`id_card_no` / `id_card_hash` 已在主表中），此处不再重复。
 
-> 身份证号是全局去重的核心。不同子公司用身份证号比对是否同一人。
-> 隐私合规：可只存哈希，查重时比对哈希值。
-
-### 3.3 子公司 HR 添加人的流程
+### 4.3 子公司 HR 添加人的流程
 
 **场景：子公司B 招聘了一名新员工 "李四"**
 
@@ -373,7 +466,7 @@ POST /api/employees/{id}/employments  （已有 person，新增用工关系）
   }
 ```
 
-### 3.4 集团 HR vs 子公司 HR 的操作范围
+### 4.4 集团 HR vs 子公司 HR 的操作范围
 
 | 操作 | 集团 HR | 子公司 HR |
 |------|---------|----------|
@@ -386,7 +479,7 @@ POST /api/employees/{id}/employments  （已有 person，新增用工关系）
 | 删除 person | ❌（只能禁用） | ❌（只能禁用） |
 | 跨实体查重 | ✅ | ✅（仅返回 masked 信息） |
 
-## 四、典型场景完整流程
+## 五、典型场景完整流程
 
 ### 场景 1：集团内兼职
 
@@ -464,7 +557,7 @@ POST /api/employees/{id}/employments  （已有 person，新增用工关系）
 
 ---
 
-## 五、数据权限变化
+## 六、数据权限变化
 
 ### dept_path 前缀规则
 
@@ -506,7 +599,7 @@ WHERE (ed.dept_path LIKE 'GROUP_A/1/10/%' OR ed.dept_path LIKE 'SUBSIDIARY_B/1/2
 
 ---
 
-## 六、员工端 UI 影响
+## 七、员工端 UI 影响
 
 ### 身份选择器
 
@@ -530,7 +623,7 @@ WHERE (ed.dept_path LIKE 'GROUP_A/1/10/%' OR ed.dept_path LIKE 'SUBSIDIARY_B/1/2
 
 ---
 
-## 七、一期 MVP 简化建议
+## 八、一期 MVP 简化建议
 
 这个模型很全，但一期不需要全部实现：
 
